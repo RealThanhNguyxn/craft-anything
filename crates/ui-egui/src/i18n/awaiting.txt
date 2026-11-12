@@ -2,3 +2,7 @@
 # One per line, written as in a catalog's first column (\n for a line break).
 # `cargo xtask i18n-coverage` lets these be missing from the catalogs, and fails once a string
 # here is translated in every catalog or no longer shown: the translation PR takes it out.
+Craft Anything {new} is available (you have {now}).
+Get it
+Later
+Check quietly

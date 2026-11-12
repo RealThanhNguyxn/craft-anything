@@ -2133,6 +2133,33 @@ fn a_big_cost_doesnt_paint_over_its_caption() {
     assert!(!caption.intersects(value), "{caption:?} and {value:?}");
 }
 
+/// A newer release becomes one line on Home with a link; "Later" waves it away for the session,
+/// and without one there's nothing at all.
+#[test]
+fn a_newer_release_is_offered_on_home_and_only_when_there_is_one() {
+    let mut h = harness_sized(egui::vec2(1280.0, 900.0), || {
+        let mut a = demo::app(demo::engine(Mode::Beginner, true));
+        demo::fill_project(&mut a);
+        a.state.screen = Screen::Home;
+        a.update = Some(craft_anything_setup::updates::Update { version: "9.9.9".into(), page: "https://example.com/new".into() });
+        a
+    });
+    h.run_steps(3);
+    h.get_by_label_contains("Craft Anything 9.9.9 is available");
+    h.get_by_label("Get it");
+    h.get_by_label("Later").click();
+    h.run_steps(2);
+    assert!(h.query_by_label_contains("Craft Anything 9.9.9 is available").is_none(), "Later hides the notice for the session");
+    let mut none = harness_sized(egui::vec2(1280.0, 900.0), || {
+        let mut a = demo::app(demo::engine(Mode::Beginner, true));
+        demo::fill_project(&mut a);
+        a.state.screen = Screen::Home;
+        a
+    });
+    none.run_steps(3);
+    assert!(none.query_by_label("Get it").is_none(), "no newer release, no notice");
+}
+
 #[test]
 fn ghidras_memory_is_automatic_until_the_person_sets_it() {
     let mut h = harness_sized(egui::vec2(1280.0, 1000.0), || {

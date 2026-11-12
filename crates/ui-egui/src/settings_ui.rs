@@ -187,6 +187,16 @@ fn general(app: &mut CraftApp, ui: &mut Ui) {
     if LANGUAGES.len() > 1 {
         language(app, ui);
     }
+    row(
+        ui,
+        "Check for a new version",
+        "When the app opens, ask GitHub quietly for a newer Craft Anything and say so on Home. Nothing about you is sent, and no answer is fine.",
+        |ui| {
+            if widgets::toggle(ui, &mut app.settings.check_for_updates, "Check quietly").changed() {
+                app.settings_changed();
+            }
+        },
+    );
     row(ui, "Show the welcome again", "Runs the first-run steps next time.", |ui| {
         if widgets::secondary(ui, Some("refresh-cw"), "Reset").clicked() {
             app.settings.first_run_done = false;

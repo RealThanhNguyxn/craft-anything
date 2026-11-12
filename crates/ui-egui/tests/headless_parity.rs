@@ -149,6 +149,7 @@ const ACTIONS: &[Action] = &[
 const PLUMBING: &[(&str, &str)] = &[
     ("load_agent_model_catalog", "worker dispatch shared by the model picker and its reload action"),
     ("check_backend_keys", "a worker that fills the saved-key status rows"),
+    ("check_updates_once", "startup: asks GitHub for a newer release on a worker, once a session"),
     ("stuck_banner", "draws what the lock watchdog found; `sync::problems` and its log are the headless side"),
     ("act", "runs a button's tool on a worker (play, preview, open folder)"),
     ("waiting_question", "finds the question an answer is for"),

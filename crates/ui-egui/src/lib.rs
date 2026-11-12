@@ -227,6 +227,8 @@ pub enum Done {
     },
     /// Ghidra and its Java were downloaded and set up for Deep mode.
     GhidraGot,
+    /// A quiet check for a newer Craft Anything finished (`None`: nothing newer, or no answer).
+    Update(Option<craft_anything_setup::updates::Update>),
     /// A tool started by a button finished (see `CraftApp::act`).
     Acted {
         tool: &'static str,
@@ -482,6 +484,13 @@ pub struct CraftApp {
     /// Why an expected coding agent may be missing, from the last scan.
     pub detect_hints: Vec<craft_anything_ai::detect::DetectHint>,
     pub detecting: bool,
+    /// A newer Craft Anything announced by GitHub (`None`: nothing newer, not checked yet, or the
+    /// check is turned off).
+    pub update: Option<craft_anything_setup::updates::Update>,
+    /// The notice was waved away for this session.
+    pub update_dismissed: bool,
+    /// The quiet check ran once this session.
+    update_checked: bool,
     /// Local agent checks: None while the worker runs, then a credential-free status or error.
     pub agent_connections: std::collections::BTreeMap<String, Option<Result<String, String>>>,
     /// Which agent owns each pending check, including failures before the worker body starts.
@@ -618,6 +627,9 @@ impl CraftApp {
             detected: None,
             detect_hints: Vec::new(),
             detecting: false,
+            update: None,
+            update_dismissed: false,
+            update_checked: false,
             agent_connections: Default::default(),
             agent_connection_jobs: Default::default(),
             backend_choices: 0,
@@ -1527,6 +1539,7 @@ impl CraftApp {
         };
         match done {
             Done::Nothing => {}
+            Done::Update(update) => self.update = update,
             Done::Projects(mut p) => {
                 if let Some(ws) = &self.workspace
                     && !p.iter().any(|w| w.root == ws.root)
@@ -1861,6 +1874,9 @@ impl CraftApp {
             self.applied_theme = Some(want);
         }
         self.take_finished_jobs();
+        if !self.headless {
+            self.check_updates_once();
+        }
         if let Some(url) = self.open_url.take() {
             ctx.open_url(egui::OpenUrl::new_tab(url));
         }
@@ -2102,6 +2118,20 @@ pub(crate) fn backends(hub: &AiHub) -> Done {
 }
 
 impl CraftApp {
+    /// Ask GitHub once per session for a newer release, on a worker and only when the person
+    /// allows it (Settings → General). The answer becomes one line on Home; a failure is silent.
+    fn check_updates_once(&mut self) {
+        if self.update_checked {
+            return;
+        }
+        self.update_checked = true;
+        if !self.settings.check_for_updates {
+            return;
+        }
+        let cache = craft_anything_setup::updates::cache_path();
+        self.jobs.spawn("Check for a new version", false, move |_| Ok(Done::Update(craft_anything_setup::updates::check(env!("CARGO_PKG_VERSION"), &cache))));
+    }
+
     /// Act on every background job that has finished since the last frame.
     pub(crate) fn take_finished_jobs(&mut self) {
         for f in self.jobs.poll() {

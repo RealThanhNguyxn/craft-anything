@@ -19,6 +19,7 @@ pub mod doctor;
 pub mod plan;
 pub mod skill;
 pub mod tools;
+pub mod updates;
 pub mod yaml;
 
 pub use clients::{Client, Format, Host, Os, SERVER_NAME, Shape, clients, is_owned_entry};
