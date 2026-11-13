@@ -1697,6 +1697,53 @@ mod picking_up_a_build {
         }
     }
 
+    /// The rebuild tests use a shell stand-in for OpenCode. Keep its protocol and argument
+    /// handling, but don't require an installed `craft-anything-cli` beside the test binary.
+    /// The helper preflight itself is covered by `a_missing_helper_stops_the_build_before_any_work`.
+    struct TestOpenCode;
+
+    impl crate::cli_agents::AgentAdapter for TestOpenCode {
+        fn ids(&self) -> &'static [&'static str] {
+            crate::cli_agents::adapters::OpenCode.ids()
+        }
+
+        fn has_model_catalog(&self) -> bool {
+            crate::cli_agents::adapters::OpenCode.has_model_catalog()
+        }
+
+        fn check_tool_server(&self, _stop: &CancelToken) -> Result<(), ToolError> {
+            Ok(())
+        }
+
+        fn mcp_env(&self, mcp: &crate::cli_agents::McpCommand) -> Result<Option<(&'static str, String)>, ToolError> {
+            crate::cli_agents::adapters::OpenCode.mcp_env(mcp)
+        }
+
+        fn args(&self, cx: &crate::cli_agents::ArgsCx) -> Vec<String> {
+            crate::cli_agents::adapters::OpenCode.args(cx)
+        }
+
+        fn required_flags(&self) -> (&'static [&'static str], &'static [&'static str]) {
+            crate::cli_agents::adapters::OpenCode.required_flags()
+        }
+
+        fn plain_fallback(&self) -> bool {
+            crate::cli_agents::adapters::OpenCode.plain_fallback()
+        }
+
+        fn discard_unfinished(&self, program: &str, id: &str, host: Option<&str>) -> Result<(), ToolError> {
+            crate::cli_agents::adapters::OpenCode.discard_unfinished(program, id, host)
+        }
+
+        fn discards_sessions(&self) -> bool {
+            crate::cli_agents::adapters::OpenCode.discards_sessions()
+        }
+
+        fn parse(&self, parser: &mut crate::cli_agents::StreamParser, value: &serde_json::Value) -> Vec<crate::AgentEvent> {
+            crate::cli_agents::adapters::OpenCode.parse(parser, value)
+        }
+    }
+
     struct Bench {
         _dir: tempfile::TempDir,
         hub: AiHub,
@@ -1747,6 +1794,7 @@ mod picking_up_a_build {
 
     fn try_with(b: &Bench, ws: &Workspace, mut opts: RunOptions) -> (bool, Vec<feed::FeedItem>) {
         opts.kinds.register(Arc::new(FlakyKind));
+        opts.adapters.register(Arc::new(TestOpenCode));
         opts.backend = Some("Stand-in".into());
         let run = RebuildRun::start(&b.hub, Workspace::open(&ws.root).unwrap(), opts).unwrap();
         let began = Instant::now();
