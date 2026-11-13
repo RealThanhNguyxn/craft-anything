@@ -10,6 +10,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Where the newest release is announced (unauthenticated; one call a day at most).
 pub const LATEST: &str = "https://api.github.com/repos/storytold/craft-anything/releases/latest";
+/// Browser-facing fallback when GitHub omits or rejects `html_url`.
+const RELEASES_LATEST: &str = "https://github.com/storytold/craft-anything/releases/latest";
 /// The only place a release page may live: this repo's releases on github.com.
 const RELEASES: &str = "https://github.com/storytold/craft-anything/releases/";
 /// Generic, non-identifying User-Agent (GitHub asks for one).
@@ -136,7 +138,7 @@ fn write_saved(cache: &Path, saved: &Saved) {
 fn notice(current: &str, s: &Saved) -> Option<Update> {
     let (tag, page) = (s.version.as_deref()?, s.page.as_deref()?);
     let version = tag.trim().strip_prefix('v').unwrap_or(tag.trim());
-    let page = if is_release_page(page) { page } else { LATEST };
+    let page = if is_release_page(page) { page } else { RELEASES_LATEST };
     is_newer(current, tag).then(|| Update { version: version.to_string(), page: page.to_string() })
 }
 
@@ -177,7 +179,7 @@ fn fetch(url: &str) -> Result<(String, String), ToolError> {
         .and_then(|t| t.as_str())
         .filter(|t| !t.trim().is_empty())
         .ok_or_else(|| ToolError::new(ErrorCode::GarbledOutput, "The newest release has no tag."))?;
-    let page = v.get("html_url").and_then(|u| u.as_str()).filter(|u| is_release_page(u)).unwrap_or(LATEST);
+    let page = v.get("html_url").and_then(|u| u.as_str()).filter(|u| is_release_page(u)).unwrap_or(RELEASES_LATEST);
     Ok((tag.to_string(), page.to_string()))
 }
 
@@ -213,11 +215,7 @@ mod tests {
                 let _ = s.read(&mut buf);
                 on_request();
                 counter.fetch_add(1, Ordering::SeqCst);
-                let _ = write!(
-                    s,
-                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
+                let _ = write!(s, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
             }
         });
         (format!("http://127.0.0.1:{port}/latest"), hits)
@@ -272,29 +270,24 @@ mod tests {
 
     #[test]
     fn the_newest_release_is_read_from_githubs_answer() {
-        let (url, hits) = serve(
-            "200 OK",
-            r#"{"tag_name":"v9.9.9","html_url":"https://github.com/storytold/craft-anything/releases/tag/v9.9.9"}"#,
-        );
+        let (url, hits) = serve("200 OK", r#"{"tag_name":"v9.9.9","html_url":"https://github.com/storytold/craft-anything/releases/tag/v9.9.9"}"#);
         let (tag, page) = fetch(&url).unwrap();
         assert_eq!((tag.as_str(), page.as_str()), ("v9.9.9", PAGE));
         assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
     #[test]
-    fn a_page_outside_the_repos_releases_falls_back_to_latest() {
-        let (url, _) = serve(
-            "200 OK",
-            r#"{"tag_name":"v9.9.9","html_url":"https://github.com.attacker.example/storytold/craft-anything/releases/tag/v9.9.9"}"#,
-        );
+    fn a_page_outside_the_repos_releases_falls_back_to_the_browser_release_page() {
+        let (url, _) =
+            serve("200 OK", r#"{"tag_name":"v9.9.9","html_url":"https://github.com.attacker.example/storytold/craft-anything/releases/tag/v9.9.9"}"#);
         let (tag, page) = fetch(&url).unwrap();
-        assert_eq!((tag.as_str(), page.as_str()), ("v9.9.9", LATEST));
+        assert_eq!((tag.as_str(), page.as_str()), ("v9.9.9", RELEASES_LATEST));
     }
 
     #[test]
     fn a_tampered_page_in_the_saved_file_is_not_offered() {
         let saved = Saved { attempted_ms: now_ms(), version: Some("v9.9.9".into()), page: Some("https://attacker.example/x".into()) };
-        assert_eq!(notice("0.1.0", &saved), Some(Update { version: "9.9.9".into(), page: LATEST.into() }));
+        assert_eq!(notice("0.1.0", &saved), Some(Update { version: "9.9.9".into(), page: RELEASES_LATEST.into() }));
     }
 
     #[test]
@@ -371,10 +364,7 @@ mod tests {
         let cache = dir.path().join("update-check.json");
         let stale = Saved { attempted_ms: now_ms() - 2 * DAY_MS, version: Some("v1.0.0".into()), page: Some(OLD_PAGE.into()) };
         write_cache(&cache, &serde_json::to_string(&stale).unwrap());
-        let (url, hits) = serve(
-            "200 OK",
-            r#"{"tag_name":"v9.9.9","html_url":"https://github.com/storytold/craft-anything/releases/tag/v9.9.9"}"#,
-        );
+        let (url, hits) = serve("200 OK", r#"{"tag_name":"v9.9.9","html_url":"https://github.com/storytold/craft-anything/releases/tag/v9.9.9"}"#);
 
         assert_eq!(check_with(&url, "0.1.0", &cache), Some(Update { version: "9.9.9".into(), page: PAGE.into() }));
         assert_eq!(hits.load(Ordering::SeqCst), 1);
