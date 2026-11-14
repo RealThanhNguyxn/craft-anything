@@ -1,6 +1,5 @@
 use super::check::build_check;
 use super::*;
-use crate::cli_agents::AgentAdapter;
 
 #[path = "note_progress_tests.rs"]
 mod note_progress;
