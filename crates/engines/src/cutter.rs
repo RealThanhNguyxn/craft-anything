@@ -3,9 +3,10 @@
 //! one `GET /cmd/<command>` answered with its text output. Only 127.0.0.1 is ever contacted.
 
 use craft_anything_evidence::{ErrorCode, ToolError};
+use craft_anything_platform::retry;
 use serde_json::{Value, json};
-use std::io::Read;
-use std::time::Duration;
+use std::io::{ErrorKind, Read};
+use std::time::{Duration, Instant};
 
 /// Rizin's default HTTP port (`http.port`).
 pub const DEFAULT_PORT: u16 = 9090;
@@ -28,26 +29,40 @@ fn encode(cmd: &str) -> String {
     out
 }
 
-/// Run one command in the session on `port`; the text and whether it was cut at 4 MiB.
+/// Calls [`command`] makes for one command while a signal keeps interrupting them.
+const TRIES: u32 = 3;
+
+/// Run one command in the session on `port`; the text and whether it was cut at 4 MiB. A call
+/// interrupted by a signal is made again, up to three calls within `timeout` in all, so use this
+/// only for commands that change nothing in the session: the interrupted one may already have run.
 pub fn command(port: u16, cmd: &str, timeout: Duration) -> Result<(String, bool), ToolError> {
+    run(port, cmd, timeout, TRIES)
+}
+
+/// [`command`] called once, for commands that may change the session (a relative seek, a comment,
+/// a flag): an interrupted call is reported as interrupted, since the command may already have run.
+pub fn command_once(port: u16, cmd: &str, timeout: Duration) -> Result<(String, bool), ToolError> {
+    run(port, cmd, timeout, 1)
+}
+
+fn run(port: u16, cmd: &str, timeout: Duration, tries: u32) -> Result<(String, bool), ToolError> {
     let url = format!("http://127.0.0.1:{port}/cmd/{}", encode(cmd));
+    let deadline = Instant::now().checked_add(timeout).ok_or_else(|| ToolError::invalid("The time limit for a Cutter command is too long."))?;
     let agent = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .user_agent("CraftAnything-dev")
         .timeout_connect(Some(Duration::from_secs(2)))
-        .timeout_global(Some(timeout))
         .build()
         .new_agent();
-    let resp = agent.get(&url).call().map_err(|e| {
-        let code = if matches!(e, ureq::Error::Timeout(_)) { ErrorCode::TimedOut } else { ErrorCode::NotFound };
-        ToolError::new(code, format!("No Cutter session answered on port {port}: {e}")).with_remediation(HOW_TO_OPEN)
-    })?;
+    let resp = retry::when_interrupted(tries, deadline, |left| agent.get(&url).config().timeout_global(Some(left)).build().call(), interrupted)
+        .map_err(|e| call_error(port, e))?;
     let status = resp.status().as_u16();
     if !(200..300).contains(&status) {
         return Err(ToolError::new(ErrorCode::NotFound, format!("The session on port {port} answered HTTP {status}"))
             .with_remediation("Check that the port belongs to a Cutter or Rizin session (`=h& 9090` in its console)."));
     }
     let mut body = Vec::new();
+    // `read_to_end` itself reads again after an interrupted read.
     resp.into_body()
         .into_reader()
         .take(MAX_BODY + 1)
@@ -56,6 +71,24 @@ pub fn command(port: u16, cmd: &str, timeout: Duration) -> Result<(String, bool)
     let truncated = body.len() as u64 > MAX_BODY;
     body.truncate(MAX_BODY as usize);
     Ok((String::from_utf8_lossy(&body).into_owned(), truncated))
+}
+
+/// Whether a call failed only because a signal interrupted it (EINTR), which says nothing about
+/// the session.
+fn interrupted(e: &ureq::Error) -> bool {
+    matches!(e, ureq::Error::Io(io) if io.kind() == ErrorKind::Interrupted)
+}
+
+fn call_error(port: u16, e: ureq::Error) -> ToolError {
+    if interrupted(&e) {
+        let mut err =
+            ToolError::new(ErrorCode::ProgramFailed, format!("The call to the Cutter session on port {port} was interrupted before it answered: {e}"))
+                .with_remediation("A signal on this computer cut the call short, not the session: run the command again (it may already have run once).");
+        err.retryable = true;
+        return err;
+    }
+    let code = if matches!(e, ureq::Error::Timeout(_)) { ErrorCode::TimedOut } else { ErrorCode::NotFound };
+    ToolError::new(code, format!("No Cutter session answered on port {port}: {e}")).with_remediation(HOW_TO_OPEN)
 }
 
 /// What the session on `port` has open, or `None` when nothing answers there.
@@ -148,6 +181,20 @@ mod tests {
         client.read_to_string(&mut response).unwrap();
         assert_eq!(h.join().unwrap(), "GET /cmd/ij HTTP/1.1");
         assert_eq!(response, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+    }
+
+    #[test]
+    fn an_interrupted_call_is_not_a_missing_session() {
+        let eintr = || ureq::Error::Io(std::io::Error::from(ErrorKind::Interrupted));
+        assert!(interrupted(&eintr()));
+        assert!(!interrupted(&ureq::Error::Io(std::io::Error::from(ErrorKind::ConnectionRefused))));
+        assert!(!interrupted(&ureq::Error::ConnectionFailed));
+        let e = call_error(9090, eintr());
+        assert_eq!((e.code, e.retryable), (ErrorCode::ProgramFailed, true), "{e:?}");
+        assert!(e.message.contains("interrupted"), "{e:?}");
+        let refused = call_error(9090, ureq::Error::Io(std::io::Error::from(ErrorKind::ConnectionRefused)));
+        assert_eq!(refused.code, ErrorCode::NotFound);
+        assert!(refused.message.starts_with("No Cutter session answered on port 9090"), "{refused:?}");
     }
 
     #[test]

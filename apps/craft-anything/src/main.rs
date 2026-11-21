@@ -104,8 +104,19 @@ fn main() -> eframe::Result {
     // the bundle's; no icon at all would bring eframe's own.
     let icon = if cfg!(target_os = "macos") { None } else { eframe::icon_data::from_png_bytes(craft_anything_ui_egui::APP_ICON_PNG).ok() };
     let viewport = viewport.with_icon(Arc::new(icon.unwrap_or_default()));
-    #[cfg_attr(not(any(windows, target_os = "linux")), expect(unused_mut, reason = "only Windows and Linux pick their own graphics adapter"))]
     let mut options = eframe::NativeOptions { viewport, ..Default::default() };
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup {
+        // egui-wgpu asks every GPU for textures of 8192 px at most, and the window's surface can't
+        // be larger, so on a display wider than that (5120 points at 2x) the app aborted before
+        // its window showed (#1639). Ask for what the GPU supports; never less than before.
+        let base = Arc::clone(&setup.device_descriptor);
+        setup.device_descriptor = Arc::new(move |adapter| {
+            let mut descriptor = base(adapter);
+            let limits = &mut descriptor.required_limits;
+            limits.max_texture_dimension_2d = limits.max_texture_dimension_2d.max(adapter.limits().max_texture_dimension_2d);
+            descriptor
+        });
+    }
     #[cfg(target_os = "linux")]
     if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup {
         // egui-wgpu's default is the discrete GPU; on a laptop whose integrated GPU drives the
@@ -139,6 +150,7 @@ fn main() -> eframe::Result {
                 CraftApp::setup_context(&cc.egui_ctx);
                 let mut app = CraftApp::new(engine, hub);
                 app.show_update_outcome_on_start();
+                app.check_for_updates_on_start();
                 // The window is built hidden and its first frame is drawn afterwards, where a graphics
                 // driver may still crash: the mark stays until frames have been shown (#74).
                 app.after_first_frames(move || {

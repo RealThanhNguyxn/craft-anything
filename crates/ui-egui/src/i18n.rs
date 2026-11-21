@@ -117,13 +117,11 @@ pub fn tr(s: &str) -> String {
     }
 }
 
-/// Translate, then fill `{name}` placeholders.
+/// Translate, then fill `{name}` placeholders in one pass (`platform::text::fill`), so an inserted
+/// value stays literal even when it looks like a placeholder.
 pub fn trf(s: &str, args: &[(&str, &str)]) -> String {
-    let mut out = tr(s);
-    for (k, v) in args {
-        out = out.replace(&format!("{{{k}}}"), v);
-    }
-    out
+    let template = tr(s);
+    if template.contains('{') { craft_anything_platform::text::fill(&template, args) } else { template }
 }
 
 #[cfg(test)]
@@ -136,7 +134,9 @@ mod tests {
         assert_eq!(m.get("Hello").map(String::as_str), Some("Hola"));
         assert!(!m.contains_key("Empty"));
         assert_eq!(trf("Open {name}", &[("name", "a.exe")]), "Open a.exe");
+        assert_eq!(trf("{a} {b}", &[("a", "{b}"), ("b", "x")]), "{b} x");
         assert_eq!(tr("Untranslated"), "Untranslated");
+        assert_eq!(trf("Untranslated", &[("a", "1")]), "Untranslated");
     }
 
     /// Script and region matching: an explicit script wins over a region, a registered language

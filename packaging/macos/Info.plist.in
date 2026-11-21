@@ -44,6 +44,11 @@
   <false/>
   <key>NSHumanReadableCopyright</key>
   <string>Copyright © the ArtCraft Team and the Craft Anything contributors. MIT OR Apache-2.0.</string>
+  <!-- Shown in the macOS Automation consent prompt when the app sends Apple Events to another
+       app through a plugin. Without this key macOS silently denies the events and the app
+       never appears in System Settings > Privacy > Automation (#1939). -->
+  <key>NSAppleEventsUsageDescription</key>
+  <string>Craft Anything will control the other app to read what it shows, only when you ask it to.</string>
 
 </dict>
 </plist>

@@ -95,18 +95,26 @@ enum KeychainGet {
 pub struct KeyStore {
     file: PathBuf,
     use_keychain: bool,
+    use_env: bool,
 }
 
 impl KeyStore {
     /// The default store: keychain + `<config dir>/ai-keys.toml`.
     pub fn system() -> Self {
         let no_chain = std::env::var(NO_KEYCHAIN_ENV).is_ok_and(|v| v == "1");
-        KeyStore { file: craft_anything_engine::settings::config_dir().join("ai-keys.toml"), use_keychain: !no_chain }
+        KeyStore { file: craft_anything_engine::settings::config_dir().join("ai-keys.toml"), use_keychain: !no_chain, use_env: true }
     }
 
     /// A file-only store (tests).
     pub fn file_only(file: PathBuf) -> Self {
-        KeyStore { file, use_keychain: false }
+        KeyStore { file, use_keychain: false, use_env: true }
+    }
+
+    /// A file-only store that also ignores the environment, so a test that needs a backend to
+    /// have no key doesn't depend on the machine's variables.
+    #[cfg(test)]
+    pub(crate) fn file_only_without_env(file: PathBuf) -> Self {
+        KeyStore { file, use_keychain: false, use_env: false }
     }
 
     fn read_file(&self) -> toml::Table {
@@ -145,9 +153,10 @@ impl KeyStore {
         self.read_file().get(backend).and_then(|v| v.as_str()).map(str::to_string).filter(|k| !k.is_empty())
     }
 
-    /// The key to use: stored, else the kind's environment variable.
+    /// The key to use: stored, else the kind's environment variable (when this store reads it).
     pub fn resolve(&self, backend: &str, kind: BackendKind) -> Option<String> {
-        self.get(backend).or_else(|| env_var(kind).and_then(|v| std::env::var(v).ok()).filter(|k| !k.trim().is_empty()))
+        let from_env = self.use_env.then(|| env_var(kind).and_then(|v| std::env::var(v).ok()).filter(|k| !k.trim().is_empty())).flatten();
+        self.get(backend).or(from_env)
     }
 
     /// Save a key. Returns where it went: `"keychain"` or `"file"`.

@@ -557,3 +557,273 @@ fn allow_run_says_what_it_turns_off_on_startup() {
     assert!(notice.contains("--allow-run"), "{notice}");
     assert!(notice.contains("without asking"), "say what it turns off: {notice}");
 }
+
+#[test]
+fn stdio_transcript_parity_and_envelope_framing() {
+    let transcript = concat!(
+        "\n",
+        "   \r\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"parity-client\",\"version\":\"1.0\"}}}\r\n",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":\"list-1\",\"method\":\"tools/list\",\"params\":{}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"ping\",\"params\":{}}\n",
+        "{not-json\n",
+        "[{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}]\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":3}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"ping\",\"params\":42}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"no/such_method\",\"params\":{}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"core_session_show\",\"arguments\":{}}}"
+    );
+
+    let engine = Arc::new(Engine::new(craft_anything_engine::testing::session()));
+    let buf = Buf::default();
+    serve(engine, ServerOptions::default(), std::io::Cursor::new(transcript.as_bytes().to_vec()), Box::new(buf.clone())).unwrap();
+    let raw_out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+
+    assert!(raw_out.ends_with('\n'), "every emitted stdio frame must end with a newline: {raw_out:?}");
+
+    // Every emitted frame must round-trip cleanly through craft_mcp_server::read_message.
+    let mut out_reader = std::io::Cursor::new(raw_out.as_bytes().to_vec());
+    let mut frames = Vec::new();
+    while let Some(incoming) = craft_mcp_server::read_message(&mut out_reader, MAX_REQUEST_BYTES).unwrap() {
+        match incoming {
+            craft_mcp_server::Incoming::Line(line) => {
+                let parsed: Value = serde_json::from_str(line.trim_end_matches(['\r', '\n'])).unwrap();
+                assert_eq!(parsed["jsonrpc"], "2.0");
+                frames.push(parsed);
+            }
+            craft_mcp_server::Incoming::Refused(reply) => panic!("unexpected refused output frame: {reply}"),
+        }
+    }
+
+    assert_eq!(frames.len(), 9, "expected 9 responses (1 notification + 2 blank lines skipped): {frames:?}");
+
+    // 1. initialize
+    assert_eq!(frames[0]["id"], json!(1));
+    assert_eq!(frames[0]["result"]["protocolVersion"], "2025-03-26");
+    assert_eq!(frames[0]["result"]["serverInfo"]["name"], SERVER_NAME);
+    assert_eq!(frames[0], craft_mcp_server::response(json!(1), frames[0]["result"].clone()));
+
+    // 2. tools/list (string id)
+    assert_eq!(frames[1]["id"], json!("list-1"));
+    assert_eq!(frames[1], craft_mcp_server::response(json!("list-1"), frames[1]["result"].clone()));
+    let listed = tool_names(&frames[1]);
+    assert!(listed.contains(&"core_session_show".to_string()));
+    assert!(listed.contains(&"core_investigation_show".to_string()));
+    assert!(listed.contains(&"enable_toolset".to_string()));
+
+    // 3. ping with null id
+    assert_eq!(frames[2], craft_mcp_server::response(Value::Null, json!({})));
+
+    // 4. error framing parity with craft-jsonrpc
+    assert_eq!(frames[3], craft_jsonrpc::parse_error_response());
+    assert_eq!(frames[4], craft_jsonrpc::error_response(Value::Null, craft_jsonrpc::RpcError::new(-32600, "Batches are not supported")));
+    assert_eq!(frames[5], craft_jsonrpc::error_response(json!(3), craft_jsonrpc::RpcError::new(-32600, "Invalid request")));
+    assert_eq!(frames[6], craft_jsonrpc::error_response(json!(4), craft_jsonrpc::RpcError::new(-32602, "Invalid params")));
+    assert_eq!(frames[7], craft_jsonrpc::error_response(json!(5), craft_jsonrpc::RpcError::new(-32601, "Method not found: no/such_method")));
+
+    // 5. tools/call (final line without trailing newline at EOF)
+    assert_eq!(frames[8]["id"], json!(6));
+    assert_eq!(frames[8], craft_mcp_server::response(json!(6), frames[8]["result"].clone()));
+    assert_eq!(frames[8]["result"]["isError"], false);
+    assert_eq!(frames[8]["result"]["structuredContent"]["result"]["server"]["name"], SERVER_NAME);
+}
+
+#[test]
+fn stdio_eof_and_newline_bounds() {
+    for empty in ["", "\n", "\r\n  \n\t\r\n"] {
+        let engine = Arc::new(Engine::new(craft_anything_engine::testing::session()));
+        let buf = Buf::default();
+        serve(engine, ServerOptions::default(), std::io::Cursor::new(empty.as_bytes().to_vec()), Box::new(buf.clone())).unwrap();
+        assert!(buf.0.lock().unwrap().is_empty(), "empty/whitespace input {empty:?} must produce no output");
+    }
+
+    // Single request without trailing newline before EOF must still be answered with a newline-terminated frame.
+    let no_eof_newline = "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"ping\"}";
+    let engine = Arc::new(Engine::new(craft_anything_engine::testing::session()));
+    let buf = Buf::default();
+    serve(engine, ServerOptions::default(), std::io::Cursor::new(no_eof_newline.as_bytes().to_vec()), Box::new(buf.clone())).unwrap();
+    let raw = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    assert!(raw.ends_with('\n'));
+    let parsed: Value = serde_json::from_str(raw.trim_end()).unwrap();
+    assert_eq!(parsed, craft_mcp_server::response(json!(42), json!({})));
+
+    // Oversized line boundary via craft_mcp_server::read_message returns Incoming::Refused.
+    let oversized = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n";
+    let mut reader = std::io::Cursor::new(oversized.as_bytes().to_vec());
+    match craft_mcp_server::read_message(&mut reader, 16).unwrap() {
+        Some(craft_mcp_server::Incoming::Refused(reply)) => {
+            let err: Value = serde_json::from_str(reply.trim()).unwrap();
+            assert_eq!(err["jsonrpc"], "2.0");
+            assert!(err["error"]["code"].is_i64());
+        }
+        _ => panic!("expected Incoming::Refused for oversized line"),
+    }
+}
+
+#[test]
+fn stdio_initialize_negotiation_and_client_budget_transcript() {
+    let mut lines: Vec<Value> = PROTOCOL_VERSIONS
+        .iter()
+        .enumerate()
+        .map(|(i, version)| {
+            req(
+                (i + 1) as u64,
+                "initialize",
+                json!({"protocolVersion": version, "capabilities": {}, "clientInfo": {"name": "parity-client", "version": "1.0"}}),
+            )
+        })
+        .collect();
+    lines.push(req(99, "initialize", json!({"protocolVersion": "1999-01-01", "capabilities": {}, "clientInfo": {"name": "Claude-Code", "version": "2.0"}})));
+    lines.push(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    lines.push(req(100, "tools/call", json!({"name": "core_session_show", "arguments": {}})));
+
+    let out = run(&lines);
+    assert_eq!(out.len(), PROTOCOL_VERSIONS.len() + 2);
+    for (i, version) in PROTOCOL_VERSIONS.iter().enumerate() {
+        let r = response(&out, (i + 1) as u64);
+        assert_eq!(r["result"]["protocolVersion"], *version);
+        assert_eq!(r["result"]["serverInfo"]["name"], SERVER_NAME);
+        assert!(r["result"]["instructions"].as_str().is_some_and(|s| !s.is_empty()));
+    }
+    let fallback = response(&out, 99);
+    assert_eq!(fallback["result"]["protocolVersion"], PROTOCOL_VERSIONS[0]);
+    assert_eq!(response(&out, 100)["result"]["isError"], false);
+}
+
+#[test]
+fn stdio_batch_rejection_transcript() {
+    let transcript = concat!(
+        "[]\n",
+        "[{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}]\n",
+        "[{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"},{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}]\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"ping\",\"params\":{}}\n"
+    );
+    let out = run_raw(ServerOptions::default(), transcript);
+    assert_eq!(out.len(), 4, "each batch gets one -32600 error, plus final ping: {out:?}");
+    let expected_batch_err = craft_jsonrpc::error_response(Value::Null, craft_jsonrpc::RpcError::new(-32600, "Batches are not supported"));
+    assert_eq!(out[0], expected_batch_err);
+    assert_eq!(out[1], expected_batch_err);
+    assert_eq!(out[2], expected_batch_err);
+    assert_eq!(out[3], craft_mcp_server::response(json!(3), json!({})));
+}
+
+#[test]
+fn stdio_cancel_inflight_tool_call_transcript() {
+    use craft_anything_engine::inbox::{Inbox, InboxDir};
+    use craft_anything_engine::workspace::{TargetRef, Workspace};
+    use std::io::BufReader;
+
+    struct CancelAfterPendingRead {
+        inbox: Inbox,
+        step: u8,
+        current: &'static [u8],
+        pos: usize,
+    }
+
+    impl std::io::Read for CancelAfterPendingRead {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos >= self.current.len() {
+                self.current = match self.step {
+                    0 => b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"build_command_run\",\"arguments\":{\"command\":\"echo hi\"}}}\n",
+                    1 => {
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        while self.inbox.pending().is_empty() {
+                            assert!(Instant::now() < deadline, "timed out waiting for inflight consent request");
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":1}}\n"
+                    }
+                    2 => b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\",\"params\":{}}\n",
+                    _ => return Ok(0),
+                };
+                self.pos = 0;
+                self.step += 1;
+            }
+            let n = buf.len().min(self.current.len() - self.pos);
+            buf[..n].copy_from_slice(&self.current[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::create(dir.path(), "t", "r", TargetRef::None).unwrap();
+    let engine = Arc::new(Engine::new(craft_anything_engine::testing::session()));
+    engine.session().ext.insert(Arc::new(InboxDir(ws.inbox_dir())));
+    let inbox = Inbox::new(ws.inbox_dir());
+
+    let buf = Buf::default();
+    let reader = BufReader::new(CancelAfterPendingRead { inbox, step: 0, current: &[], pos: 0 });
+    serve(engine, ServerOptions { all_tools: true, ..Default::default() }, reader, Box::new(buf.clone())).unwrap();
+    let out: Vec<Value> = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+
+    assert!(out.iter().all(|m| m["id"] != json!(1)), "cancelled inflight call must not emit a response: {out:?}");
+    assert_eq!(out, vec![craft_mcp_server::response(json!(2), json!({}))]);
+}
+
+#[test]
+fn stdio_cancel_running_job_transcript() {
+    use craft_anything_engine::inbox::InboxDir;
+    use craft_anything_engine::workspace::{TargetRef, Workspace};
+    use std::io::BufReader;
+
+    struct CancelAfterStartedRead {
+        started_marker: std::path::PathBuf,
+        first_line: Vec<u8>,
+        step: u8,
+        current: Vec<u8>,
+        pos: usize,
+    }
+
+    impl std::io::Read for CancelAfterStartedRead {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos >= self.current.len() {
+                self.current = match self.step {
+                    0 => std::mem::take(&mut self.first_line),
+                    1 => {
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        while !self.started_marker.exists() {
+                            assert!(Instant::now() < deadline, "timed out waiting for running job to start");
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":1}}\n".to_vec()
+                    }
+                    2 => b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\",\"params\":{}}\n".to_vec(),
+                    _ => return Ok(0),
+                };
+                self.pos = 0;
+                self.step += 1;
+            }
+            let n = buf.len().min(self.current.len() - self.pos);
+            buf[..n].copy_from_slice(&self.current[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::create(dir.path(), "t", "r", TargetRef::None).unwrap();
+    let engine = Arc::new(Engine::new(craft_anything_engine::testing::session()));
+    engine.session().ext.insert(Arc::new(InboxDir(ws.inbox_dir())));
+
+    let cmd = if cfg!(windows) {
+        "echo started > started.txt & ping -n 31 127.0.0.1 > NUL & echo finished > finished.txt"
+    } else {
+        "printf started > started.txt && sleep 30 && printf finished > finished.txt"
+    };
+    let first_line = format!("{}\n", req(1, "tools/call", json!({"name": "build_command_run", "arguments": {"command": cmd}}))).into_bytes();
+
+    let buf = Buf::default();
+    let reader = BufReader::new(CancelAfterStartedRead { started_marker: ws.app_dir().join("started.txt"), first_line, step: 0, current: Vec::new(), pos: 0 });
+    let started_at = Instant::now();
+    serve(engine, ServerOptions { allow_run: true, all_tools: true, ..Default::default() }, reader, Box::new(buf.clone())).unwrap();
+    let elapsed = started_at.elapsed();
+
+    let out: Vec<Value> = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+
+    assert!(elapsed < Duration::from_secs(10), "cancelled running job took too long to stop: {elapsed:?}");
+    assert!(!ws.app_dir().join("finished.txt").exists(), "cancelled running job must be aborted before completion");
+    assert!(out.iter().all(|m| m["id"] != json!(1)), "cancelled running call must not emit a response: {out:?}");
+    assert_eq!(out, vec![craft_mcp_server::response(json!(2), json!({}))]);
+}

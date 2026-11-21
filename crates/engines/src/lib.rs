@@ -58,12 +58,22 @@ pub fn display_name(id: &str) -> &'static str {
 }
 
 /// What to tell the person when an engine wasn't found, as (reason, remediation): `set` is the path
-/// in Settings → Engines, which wasn't there, and `flatpak` whether this app runs in that sandbox.
+/// in Settings → Engines, which wasn't there or was a folder without the program, and `flatpak`
+/// whether this app runs in that sandbox.
 pub fn not_found_help(id: &str, set: Option<&Path>, flatpak: bool) -> (String, String) {
     let name = display_name(id);
     // Settings → Engines can only install what has pins; these the person installs themselves.
     let manual = engine(id).is_some_and(|e| matches!(e.install, Install::Manual));
+    let program = engine(id).and_then(|e| e.host_exes().first().copied());
     let reason = match set {
+        // A folder that's there: what's missing is the program in it.
+        Some(p) if p.is_dir() => match program {
+            Some(exe) => format!(
+                "This needs {name}, and the folder set for it in Settings → Engines ({}) has no {name} program in it (`{exe}`, looked for in the folder, its `bin` folder and the folders inside it).",
+                p.display()
+            ),
+            None => format!("This needs {name}, and the path set for it in Settings → Engines ({}) is a folder, not the program.", p.display()),
+        },
         Some(p) => format!("This needs {name}, and the path set for it in Settings → Engines ({}) isn't there.", p.display()),
         None => format!("This needs {name} installed."),
     };
@@ -83,7 +93,8 @@ pub fn not_found_help(id: &str, set: Option<&Path>, flatpak: bool) -> (String, S
     (reason, remediation)
 }
 
-/// Find an engine: user override, then the managed store (`<store>/<id>/bin/<exe>`), then PATH,
+/// Find an engine: user override, then the managed store (its [`ExternalEngine::store_folder`],
+/// `<store>/<id>` unless a guided setup puts it elsewhere), then PATH,
 /// then its standard install folders, then the folders where an unpacked copy is usually kept.
 pub fn locate(id: &str, overrides: &dyn ToolPathLookup, store: &Path) -> Option<PathBuf> {
     locate_configured(id, overrides, store).or_else(|| {
@@ -97,37 +108,57 @@ pub fn locate(id: &str, overrides: &dyn ToolPathLookup, store: &Path) -> Option<
 /// Find an engine where the settings or the managed store say only: what [`locate`] finds before
 /// it looks around the computer (PATH and standard install folders).
 pub fn locate_configured(id: &str, overrides: &dyn ToolPathLookup, store: &Path) -> Option<PathBuf> {
-    if let Some(p) = overrides.override_for(id)
-        && p.exists()
-    {
+    if let Some(p) = overrides.override_for(id).and_then(|p| in_path_setting(id, &p)) {
         return Some(p);
     }
     let e = engine(id)?;
     let exes = e.host_exes();
-    if let Some(p) = in_managed(&store.join(id), exes) {
+    let managed = store.join(e.store_folder());
+    if let Some(p) = in_managed(&managed, exes) {
         return Some(p);
     }
     // A single-file install (a .jar) is found by the name its pin saved it under.
     for pin in e.pins() {
         if let ArchiveFormat::File { name } = pin.format
-            && store.join(id).join(name).is_file()
+            && managed.join(name).is_file()
         {
-            return Some(store.join(id).join(name));
+            return Some(managed.join(name));
         }
     }
     None
 }
 
+/// The program a path set in Settings → Engines names: the file itself, or, for a folder (a
+/// JDK's folder, an unzipped JADX), the engine's program inside it as an install folder holds it
+/// (see [`in_managed`]), or its single-file install (`vineflower.jar`). `None` when there's no
+/// such program, so a folder is never run as the program.
+fn in_path_setting(id: &str, p: &Path) -> Option<PathBuf> {
+    if p.is_file() {
+        return Some(p.to_path_buf());
+    }
+    if !p.is_dir() {
+        return None;
+    }
+    let e = engine(id)?;
+    in_managed(p, e.host_exes()).or_else(|| {
+        e.pins().iter().find_map(|pin| match pin.format {
+            ArchiveFormat::File { name } => Some(p.join(name)).filter(|f| f.is_file()),
+            _ => None,
+        })
+    })
+}
+
 /// An executable in a managed install folder: `<dir>/<exe>`, `<dir>/bin/<exe>` or
-/// `<dir>/support/<exe>`, in `dir` itself or in one of its sub-folders, newest name first (an
-/// archive unpacks into one top folder, often versioned: `ghidra_12.1.4_PUBLIC/support/…`).
+/// `<dir>/support/<exe>`, in `dir` itself or in one of its sub-folders, newest version first (an
+/// archive unpacks into one top folder, often versioned: `ghidra_12.1.4_PUBLIC/support/…`; a
+/// folder of JDKs holds `java-8-…` beside `java-21-…`).
 fn in_managed(dir: &Path, exes: &[&str]) -> Option<PathBuf> {
     let here = |d: &Path| exes.iter().flat_map(|exe| [d.join(exe), d.join("bin").join(exe), d.join("support").join(exe)]).find(|p| p.is_file());
     if let Some(p) = here(dir) {
         return Some(p);
     }
     let mut subs: Vec<PathBuf> = std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
-    subs.sort();
+    subs.sort_by(|a, b| version_order(&a.file_name().unwrap_or_default().to_string_lossy(), &b.file_name().unwrap_or_default().to_string_lossy()));
     subs.iter().rev().find_map(|d| here(d))
 }
 
@@ -138,12 +169,47 @@ pub fn find_in_known_roots(id: &str, exes: &[&str], roots: &[(PathBuf, usize)]) 
     roots.iter().find_map(|(root, depth)| search_named(root, id, exes, *depth))
 }
 
+/// Folder names in version order: runs of digits compare as numbers (`java-8` before `java-17`,
+/// `12.1.4` before `12.10.0`), the rest as text.
+fn version_order(a: &str, b: &str) -> std::cmp::Ordering {
+    fn parts(s: &str) -> Vec<(bool, &str)> {
+        let mut out = Vec::new();
+        let mut start = 0;
+        let mut digit = None;
+        for (i, c) in s.char_indices() {
+            let d = c.is_ascii_digit();
+            if digit.is_some_and(|was| was != d) {
+                out.push((digit == Some(true), &s[start..i]));
+                start = i;
+            }
+            digit = Some(d);
+        }
+        if start < s.len() {
+            out.push((digit == Some(true), &s[start..]));
+        }
+        out
+    }
+    let (pa, pb) = (parts(a), parts(b));
+    for ((da, sa), (db, sb)) in pa.iter().zip(&pb) {
+        let o = if *da && *db {
+            let (ta, tb) = (sa.trim_start_matches('0'), sb.trim_start_matches('0'));
+            ta.len().cmp(&tb.len()).then_with(|| ta.cmp(tb))
+        } else {
+            sa.cmp(sb)
+        };
+        if o.is_ne() {
+            return o;
+        }
+    }
+    pa.len().cmp(&pb.len()).then_with(|| a.cmp(b))
+}
+
 fn search_named(dir: &Path, id: &str, exes: &[&str], depth: usize) -> Option<PathBuf> {
     if depth == 0 {
         return None;
     }
     let mut subs: Vec<PathBuf> = std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
-    subs.sort();
+    subs.sort_by(|a, b| version_order(&a.file_name().unwrap_or_default().to_string_lossy(), &b.file_name().unwrap_or_default().to_string_lossy()));
     subs.iter().rev().find_map(|d| {
         let named = d.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.to_ascii_lowercase().starts_with(id));
         if named && let Some(p) = in_managed(d, exes) {
@@ -189,6 +255,23 @@ mod tests {
         assert_eq!(display_name("adb"), "Android platform tools (adb)");
     }
 
+    /// Asked to install Java, we say Ghidra's setup brings it; that setup unpacks it under
+    /// `<store>/jdk`, which the Java runtime engine has to find (it was looked for in `<store>/java`).
+    #[test]
+    fn the_java_ghidras_setup_brings_is_the_java_runtime() {
+        let java = if cfg!(windows) { "java.exe" } else { "java" };
+        // Linux and Windows keep the JDK's own top folder; macOS's pin strips it down to `Home`.
+        for top in ["jdk-21.0.12.1+1", "Home"] {
+            let store = tempfile::tempdir().unwrap();
+            let exe = store.path().join("jdk").join(top).join("bin").join(java);
+            std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+            std::fs::write(&exe, "").unwrap();
+            assert_eq!(locate_configured("java", &NoOverrides, store.path()), Some(exe.clone()), "{top}");
+            // The same Java Ghidra is pointed at.
+            assert_eq!(ghidra::get::java_home(None, store.path()).map(|h| h.join("bin").join(java)), Some(exe));
+        }
+    }
+
     /// Ghidra's zip unpacks into `<store>/ghidra/ghidra_<version>_PUBLIC/`, with the launcher in
     /// `support/`; `engines_list` said "not found" for an install that Deep mode was using.
     #[test]
@@ -210,6 +293,66 @@ mod tests {
         // (Unless this computer has Ghidra on PATH or from a system package.)
         let installed = find_on_path(&[exe]).is_some() || well_known("ghidra").iter().any(|p| p.is_file());
         assert!(locate("ghidra", &NoOverrides, empty.path()).is_none() || installed);
+    }
+
+    struct SetPath(PathBuf);
+    impl ToolPathLookup for SetPath {
+        fn override_for(&self, _: &str) -> Option<PathBuf> {
+            Some(self.0.clone())
+        }
+    }
+
+    /// A path set to a folder (a JDK's folder for the Java runtime) counted as found, and running
+    /// the folder then failed with "permission denied". The program in it is found instead, as an
+    /// install folder holds it; a folder without it isn't found, and says so.
+    #[test]
+    fn a_folder_set_as_an_engines_path_is_looked_in() {
+        let java = if cfg!(windows) { "java.exe" } else { "java" };
+        let store = tempfile::tempdir().unwrap();
+        let d = tempfile::tempdir().unwrap();
+        let jdk = d.path().join("jdk-21");
+        let exe = jdk.join("bin").join(java);
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, "").unwrap();
+        // The JDK's folder, or the folder that holds JDKs (`/usr/lib/jvm`).
+        assert_eq!(locate_configured("java", &SetPath(jdk.clone()), store.path()), Some(exe.clone()));
+        assert_eq!(locate_configured("java", &SetPath(d.path().to_path_buf()), store.path()), Some(exe.clone()));
+        // The program itself is taken as it is, as before.
+        assert_eq!(locate_configured("java", &SetPath(exe.clone()), store.path()), Some(exe));
+        // A single-file install's folder: its jar.
+        let jar = d.path().join("vf").join("vineflower.jar");
+        std::fs::create_dir_all(jar.parent().unwrap()).unwrap();
+        std::fs::write(&jar, "").unwrap();
+        assert_eq!(locate_configured("vineflower", &SetPath(jar.parent().unwrap().to_path_buf()), store.path()), Some(jar.clone()));
+        assert_eq!(locate_configured("vineflower", &SetPath(jar.clone()), store.path()), Some(jar));
+        // A folder without the program isn't found (the empty store holds nothing either)...
+        let empty = d.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(locate_configured("java", &SetPath(empty.clone()), store.path()), None);
+        // ...and the message says what's missing, not that the folder isn't there.
+        let (reason, fix) = not_found_help("java", Some(&empty), false);
+        assert!(reason.contains("has no Java") && reason.contains(&format!("`{java}`")) && !reason.contains("isn't there"), "{reason}");
+        assert!(fix.starts_with("Correct the path"), "{fix}");
+    }
+
+    /// A folder of JDKs (`/usr/lib/jvm`) gives its newest one, not the last by plain text order
+    /// (`java-8` sorts after `java-21` as text).
+    #[test]
+    fn a_folder_of_versions_gives_the_newest() {
+        let java = if cfg!(windows) { "java.exe" } else { "java" };
+        let store = tempfile::tempdir().unwrap();
+        let d = tempfile::tempdir().unwrap();
+        for v in ["java-8-openjdk", "java-17-openjdk", "java-21-openjdk"] {
+            std::fs::create_dir_all(d.path().join(v).join("bin")).unwrap();
+            std::fs::write(d.path().join(v).join("bin").join(java), "").unwrap();
+        }
+        let want = d.path().join("java-21-openjdk").join("bin").join(java);
+        assert_eq!(locate_configured("java", &SetPath(d.path().to_path_buf()), store.path()), Some(want));
+        use std::cmp::Ordering::*;
+        assert_eq!(version_order("ghidra_12.1.4_PUBLIC", "ghidra_12.10.0_PUBLIC"), Less);
+        assert_eq!(version_order("ghidra_12.2.0_PUBLIC", "ghidra_12.1.4_PUBLIC"), Greater);
+        assert_eq!(version_order("jdk-021", "jdk-21"), Less);
+        assert_eq!(version_order("a", "a"), Equal);
     }
 
     /// #841: a path set for a browser was ignored without a word, and the message offered an

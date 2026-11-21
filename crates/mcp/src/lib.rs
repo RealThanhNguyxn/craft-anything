@@ -30,7 +30,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// Protocol versions we speak, newest first.
-pub const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
+pub const PROTOCOL_VERSIONS: &[&str] = craft_mcp_server::SUPPORTED_VERSIONS;
 pub const SERVER_NAME: &str = "craft-anything";
 /// Default response budget (bytes of one JSON-RPC response line).
 pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
@@ -42,6 +42,8 @@ pub const MIN_MAX_RESPONSE_BYTES: usize = 64 * 1024;
 pub const CLAUDE_CODE_RESPONSE_BYTES: usize = 80 * 1024;
 /// Longest accepted request line.
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+const RPC_LIMITS: craft_jsonrpc::Limits =
+    craft_jsonrpc::Limits { max_message_bytes: MAX_REQUEST_BYTES, max_batch_items: 0, integer_ids_only: false, allow_null_ids: true };
 
 const INSTRUCTIONS: &str = "Craft Anything shows how software works, with evidence. Start with core_investigation_show and core_session_show. \
 Open a target with core_target_open (absolute path), then use focused tools; ask for summaries first and page for detail. \
@@ -168,30 +170,23 @@ pub fn serve_stdio(engine: Arc<Engine>, opts: ServerOptions) -> std::io::Result<
 
 /// Serve on any line reader / writer pair until the reader ends. In-flight calls are finished
 /// before this returns.
-pub fn serve<R: BufRead>(engine: Arc<Engine>, opts: ServerOptions, reader: R, writer: Box<dyn Write + Send>) -> std::io::Result<()> {
+pub fn serve<R: BufRead>(engine: Arc<Engine>, opts: ServerOptions, mut reader: R, writer: Box<dyn Write + Send>) -> std::io::Result<()> {
     let server = Arc::new(Server::new(engine, opts, writer));
     let mut workers: Vec<JoinHandle<()>> = Vec::new();
-    let mut reader = reader;
-    let mut buf = Vec::new();
-    loop {
-        buf.clear();
-        let n = read_line_capped(&mut reader, &mut buf)?;
-        if n == 0 {
-            break;
+    while let Some(incoming) = craft_mcp_server::read_message(&mut reader, MAX_REQUEST_BYTES)? {
+        match incoming {
+            craft_mcp_server::Incoming::Refused(reply) => server.send_raw(&reply),
+            craft_mcp_server::Incoming::Line(line) => {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Some(h) = server.clone().handle_line(line) {
+                    workers.push(h);
+                }
+                workers.retain(|h| !h.is_finished());
+            }
         }
-        let line = String::from_utf8_lossy(&buf);
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if buf.len() > MAX_REQUEST_BYTES {
-            server.send(&error_response(Value::Null, -32600, "Request too large"));
-            continue;
-        }
-        if let Some(h) = server.clone().handle_line(line) {
-            workers.push(h);
-        }
-        workers.retain(|h| !h.is_finished());
     }
     for h in workers {
         let _ = h.join();
@@ -199,40 +194,12 @@ pub fn serve<R: BufRead>(engine: Arc<Engine>, opts: ServerOptions, reader: R, wr
     Ok(())
 }
 
-/// Read one line, keeping at most MAX_REQUEST_BYTES + 1 bytes of it (the rest is discarded).
-fn read_line_capped<R: BufRead>(r: &mut R, buf: &mut Vec<u8>) -> std::io::Result<usize> {
-    let mut total = 0usize;
-    loop {
-        let chunk = match r.fill_buf() {
-            Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        };
-        if chunk.is_empty() {
-            return Ok(total);
-        }
-        let (part, done) = match chunk.iter().position(|&b| b == b'\n') {
-            Some(i) => (chunk.get(..=i).unwrap_or(chunk), true),
-            None => (chunk, false),
-        };
-        let take = part.len();
-        if buf.len() <= MAX_REQUEST_BYTES {
-            buf.extend_from_slice(part);
-        }
-        total = total.saturating_add(take);
-        r.consume(take);
-        if done {
-            return Ok(total);
-        }
-    }
-}
-
 fn error_response(id: Value, code: i64, message: &str) -> Value {
-    json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+    craft_jsonrpc::error_response(id, craft_jsonrpc::RpcError::new(code, message))
 }
 
 fn ok_response(id: Value, result: Value) -> Value {
-    json!({"jsonrpc": "2.0", "id": id, "result": result})
+    craft_mcp_server::response(id, result)
 }
 
 fn id_key(id: &Value) -> String {
@@ -261,16 +228,24 @@ impl Server {
         send_to(&self.out, msg);
     }
 
+    fn send_raw(&self, line: &str) {
+        send_raw_to(&self.out, line);
+    }
+
     fn notify(&self, method: &str, params: Value) {
         self.send(&json!({"jsonrpc": "2.0", "method": method, "params": params}));
     }
 
     /// Handle one incoming line. Tool calls run on a worker thread whose handle is returned.
     fn handle_line(self: Arc<Self>, line: &str) -> Option<JoinHandle<()>> {
-        let msg: Value = match serde_json::from_str(line) {
+        let msg = match craft_jsonrpc::parse_json(line.as_bytes(), RPC_LIMITS) {
             Ok(v) => v,
-            Err(_) => {
-                self.send(&error_response(Value::Null, -32700, "Parse error"));
+            Err(craft_jsonrpc::ParseError::MessageTooLarge) => {
+                self.send(&error_response(Value::Null, -32600, "Request too large"));
+                return None;
+            }
+            Err(craft_jsonrpc::ParseError::InvalidJson | craft_jsonrpc::ParseError::BatchTooLarge) => {
+                self.send(&craft_jsonrpc::parse_error_response());
                 return None;
             }
         };
@@ -278,25 +253,32 @@ impl Server {
             self.send(&error_response(Value::Null, -32600, "Batches are not supported"));
             return None;
         }
-        let Some(method) = msg.get("method").and_then(Value::as_str).map(str::to_string) else {
+        let Some(req) = craft_jsonrpc::request(&msg, RPC_LIMITS) else {
             // A response to something we sent, or garbage without an id: nothing to answer.
             if let Some(id) = msg.get("id").filter(|_| msg.get("result").is_none() && msg.get("error").is_none()) {
                 self.send(&error_response(id.clone(), -32600, "Invalid request"));
             }
             return None;
         };
-        let params = msg.get("params").cloned().unwrap_or(Value::Null);
-        let Some(id) = msg.get("id").cloned() else {
-            self.handle_notification(&method, &params);
+        if req.params.is_some_and(|v| !v.is_object() && !v.is_array()) {
+            if let Some(id) = req.id {
+                self.send(&error_response(id.clone(), -32602, "Invalid params"));
+            }
+            return None;
+        }
+        let params = req.params.cloned().unwrap_or(Value::Null);
+        let Some(id) = req.id.cloned() else {
+            self.handle_notification(req.method, &params);
             return None;
         };
-        if method == "tools/call" {
+        if req.method == "tools/call" {
             let token = CancelToken::default();
             self.inflight.lock().unwrap_or_else(PoisonError::into_inner).insert(id_key(&id), token.clone());
             let me = self.clone();
+            let thread_id = id.clone();
             let spawned = std::thread::Builder::new().name("mcp-call".into()).spawn(move || {
-                let resp = me.tools_call(&id, &params, &token);
-                me.inflight.lock().unwrap_or_else(PoisonError::into_inner).remove(&id_key(&id));
+                let resp = me.tools_call(&thread_id, &params, &token);
+                me.inflight.lock().unwrap_or_else(PoisonError::into_inner).remove(&id_key(&thread_id));
                 if !token.is_cancelled() {
                     me.send(&resp);
                 }
@@ -304,12 +286,12 @@ impl Server {
             return match spawned {
                 Ok(h) => Some(h),
                 Err(_) => {
-                    self.send(&error_response(msg.get("id").cloned().unwrap_or(Value::Null), -32603, "Could not start a worker"));
+                    self.send(&error_response(id, -32603, "Could not start a worker"));
                     None
                 }
             };
         }
-        let resp = match self.handle_request(&method, &params) {
+        let resp = match self.handle_request(req.method, &params) {
             Ok(result) => ok_response(id, result),
             Err((code, message)) => error_response(id, code, &message),
         };
@@ -848,13 +830,16 @@ impl Server {
 const INVESTIGATION_FILES: &[(&str, &str)] =
     &[("brief", "Investigation brief"), ("plan", "Investigation plan"), ("hypotheses", "Hypotheses"), ("findings", "Findings"), ("handoff", "Handoff note")];
 
-fn send_to(out: &Writer, msg: &Value) {
-    let Ok(mut line) = serde_json::to_string(msg) else { return };
-    line.push('\n');
+fn send_raw_to(out: &Writer, line: &str) {
     let mut w = out.lock().unwrap_or_else(PoisonError::into_inner);
-    if w.write_all(line.as_bytes()).and_then(|_| w.flush()).is_err() {
+    if w.write_all(line.as_bytes()).and_then(|_| w.write_all(b"\n")).and_then(|_| w.flush()).is_err() {
         log::warn!("MCP client went away while writing");
     }
+}
+
+fn send_to(out: &Writer, msg: &Value) {
+    let Ok(line) = serde_json::to_string(msg) else { return };
+    send_raw_to(out, &line);
 }
 
 fn tool_error_body(e: &ToolError) -> Value {

@@ -42,6 +42,9 @@ pub struct ModelTensor {
     /// Size of its data, when the type's storage layout and shape are known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data_bytes: Option<u64>,
+    /// The stored name isn't valid UTF-8. `name` shows each bad byte as `\xNN` and a backslash as `\\`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub name_not_utf8: bool,
 }
 
 /// One metadata key and a bounded view of its value.
@@ -55,6 +58,9 @@ pub struct ModelMetadata {
     pub count: Option<u64>,
     /// The value shown is only part of what the file holds.
     pub shortened: bool,
+    /// The stored key isn't valid UTF-8. `key` shows each bad byte as `\xNN` and a backslash as `\\`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub key_not_utf8: bool,
 }
 
 /// What a model file's header says.
@@ -184,6 +190,31 @@ fn shorten(s: String) -> (String, bool) {
         return (s, false);
     }
     (s.chars().take(MAX_TEXT).collect(), true)
+}
+
+/// A stored name as text, and whether its bytes weren't valid UTF-8. A valid name is kept exactly.
+/// In an invalid one each bad byte is written `\xNN` and a backslash `\\`, so two different byte
+/// strings never get the same text, and the flag keeps them apart from a valid name spelled alike.
+fn escaped_identity(bytes: &[u8]) -> (String, bool) {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return (s.to_owned(), false);
+    }
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
+    for chunk in bytes.utf8_chunks() {
+        for ch in chunk.valid().chars() {
+            if ch == '\\' {
+                out.push_str("\\\\");
+            } else {
+                out.push(ch);
+            }
+        }
+        for b in chunk.invalid() {
+            out.push_str("\\x");
+            out.push(char::from_digit(u32::from(b >> 4), 16).unwrap_or('0'));
+            out.push(char::from_digit(u32::from(b & 0x0f), 16).unwrap_or('0'));
+        }
+    }
+    (out, true)
 }
 
 fn element_count(shape: &[u64]) -> (u64, bool) {
@@ -472,22 +503,27 @@ fn parse_gguf(prefix: &[u8], file_size: u64) -> Result<ModelReport, FormatError>
     let mut alignment = 32u64;
     let mut file_type = None;
     let mut ended_early = false;
+    // Names whose bytes aren't UTF-8: kept escaped and flagged, counted for one warning.
+    let mut bad_keys = 0u64;
+    let mut bad_names = 0u64;
     let mut i = 0u64;
     while i < kv_count {
         let parsed = (|| {
             let identity = c.raw_str()?;
-            let key = String::from_utf8_lossy(identity).into_owned();
             let t = c.u32()?;
             let (value, value_type, count, shortened) = gguf_value(&mut c, t, 0)?;
-            Some((identity, ModelMetadata { key, value_type, value, count, shortened }))
+            Some((identity, value, value_type, count, shortened))
         })();
-        let Some((identity, entry)) = parsed else {
+        let Some((identity, value, value_type, count, shortened)) = parsed else {
             ended_early = true;
             break;
         };
         if !metadata_keys.insert(identity) {
             return Err(FormatError::Malformed(format!("GGUF duplicate metadata key at index {i}")));
         }
+        let (key, key_not_utf8) = escaped_identity(identity);
+        bad_keys = bad_keys.saturating_add(u64::from(key_not_utf8));
+        let entry = ModelMetadata { key, value_type, value, count, shortened, key_not_utf8 };
         r.metadata_read = r.metadata_read.saturating_add(1);
         match entry.key.as_str() {
             "general.architecture" => r.architecture = entry.value.as_str().map(str::to_string),
@@ -511,7 +547,6 @@ fn parse_gguf(prefix: &[u8], file_size: u64) -> Result<ModelReport, FormatError>
         while i < tensor_count {
             let parsed = (|| {
                 let identity = c.raw_str()?;
-                let name = String::from_utf8_lossy(identity).into_owned();
                 let dims = c.u32()?;
                 if dims > MAX_DIMS {
                     return None;
@@ -522,15 +557,17 @@ fn parse_gguf(prefix: &[u8], file_size: u64) -> Result<ModelReport, FormatError>
                 }
                 let ty = c.u32()?;
                 let offset = c.u64()?;
-                Some((identity, name, shape, ty, offset))
+                Some((identity, shape, ty, offset))
             })();
-            let Some((identity, name, shape, ty, data_offset)) = parsed else {
+            let Some((identity, shape, ty, data_offset)) = parsed else {
                 ended_early = true;
                 break;
             };
             if !tensor_names.insert(identity) {
                 return Err(FormatError::Malformed(format!("GGUF duplicate tensor name at index {i}")));
             }
+            let (name, name_not_utf8) = escaped_identity(identity);
+            bad_names = bad_names.saturating_add(u64::from(name_not_utf8));
             let (parameters, overflow) = element_count(&shape);
             if overflow {
                 r.warn(format!("{name}: its shape multiplies past what a number can hold"));
@@ -548,7 +585,7 @@ fn parse_gguf(prefix: &[u8], file_size: u64) -> Result<ModelReport, FormatError>
             };
             last_data_end = last_data_end.max(u128::from(data_offset) + u128::from(data_bytes.unwrap_or(0)));
             let (name, _) = shorten(name);
-            r.add_tensor(ModelTensor { name, dtype: ggml_type_name(ty), shape, parameters, data_offset, data_bytes });
+            r.add_tensor(ModelTensor { name, dtype: ggml_type_name(ty), shape, parameters, data_offset, data_bytes, name_not_utf8 });
             i += 1;
         }
     }
@@ -579,6 +616,16 @@ fn parse_gguf(prefix: &[u8], file_size: u64) -> Result<ModelReport, FormatError>
             }
             None => r.warn("The tensor data's start can't be worked out.".into()),
         }
+    }
+    if bad_keys > 0 || bad_names > 0 {
+        // A summary of names that are shown escaped: put it first, so a full list can't drop it.
+        r.warnings.insert(
+            0,
+            format!(
+                "{bad_keys} metadata key(s) and {bad_names} tensor name(s) aren't valid UTF-8. They are kept, marked as such, with each bad byte shown as \\xNN and a backslash as \\\\."
+            ),
+        );
+        r.warnings.truncate(MAX_WARNINGS);
     }
     r.file_type = file_type.map(|n| gguf_file_type(n).map_or_else(|| format!("type {n}"), str::to_string));
     r.quantization = dominant_quantization(&r.parameters_by_type);
@@ -714,7 +761,14 @@ fn parse_safetensors(prefix: &[u8], file_size: u64) -> Result<ModelReport, Forma
                     "name" | "modelspec.title" if r.name.is_none() => r.name = Some(shown.clone()),
                     _ => {}
                 }
-                r.metadata.push(ModelMetadata { key: mk.clone(), value_type: "string".into(), value: json!(shown), count: None, shortened });
+                r.metadata.push(ModelMetadata {
+                    key: mk.clone(),
+                    value_type: "string".into(),
+                    value: json!(shown),
+                    count: None,
+                    shortened,
+                    key_not_utf8: false,
+                });
             }
             continue;
         }
@@ -746,7 +800,7 @@ fn parse_safetensors(prefix: &[u8], file_size: u64) -> Result<ModelReport, Forma
             r.tensors_past_end = r.tensors_past_end.saturating_add(1);
         }
         let (name, _) = shorten(key.clone());
-        r.add_tensor(ModelTensor { name, dtype: dtype.to_string(), shape, parameters, data_offset: from, data_bytes });
+        r.add_tensor(ModelTensor { name, dtype: dtype.to_string(), shape, parameters, data_offset: from, data_bytes, name_not_utf8: false });
     }
     // Check all records, including those beyond the display cap. Empty tensors come
     // before a nonempty range with the same start.

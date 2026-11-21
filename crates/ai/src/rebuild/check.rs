@@ -272,6 +272,43 @@ mod tests {
         stacks::Toolchain { build: command.clone(), test: command, no_tests: no_tests.iter().map(|s| s.to_string()).collect(), ..Default::default() }
     }
 
+    /// Exercise the actual Go catalogue commands through the existing-project check path.
+    #[test]
+    #[ignore = "requires Go on PATH; runs an owned project without dependencies"]
+    fn real_go_project_build_and_tests() {
+        let project = tempfile::tempdir().unwrap();
+        let app = project.path();
+        let stop = CheckStop::default();
+        std::fs::write(app.join("go.mod"), "module example.invalid/probe\n\ngo 1.18\n").unwrap();
+        std::fs::write(app.join("main.go"), "package main\nfunc answer() int { return 42 }\nfunc main() {}\n").unwrap();
+        let tests = app.join("main_test.go");
+        let passing_test = r#"package main
+import "testing"
+func TestAnswer(t *testing.T) {
+    if answer() != 42 {
+        t.Fatal("unexpected answer")
+    }
+}
+"#;
+        std::fs::write(&tests, passing_test).unwrap();
+        let tool = stacks::toolchain_in(app).expect("go.mod identifies the Go toolchain");
+        assert_eq!(tool.name, "Go");
+
+        let build = || own_build_check(app, "the project folder", stacks::BUILDERS_CHOICE, None, &stop);
+        let test = || own_tests_check(app, Some(tool), &stop);
+        assert_eq!(build(), (true, "`go build ./...` passed.".into()));
+        assert_eq!(test(), (true, "`go test ./...` passed.".into()));
+
+        std::fs::write(&tests, passing_test.replace("!= 42", "!= 43")).unwrap();
+        assert!(build().0, "a test assertion must not fail the build");
+        let (passed, note) = test();
+        assert!(!passed && note.contains("unexpected answer"), "{note}");
+
+        std::fs::write(app.join("main.go"), "package main\nfunc main(\n").unwrap();
+        let (passed, note) = build();
+        assert!(!passed && note.starts_with("Build failed:"), "{note}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_persons_own_tests_decide_and_no_tests_is_no_failure() {

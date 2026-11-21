@@ -112,4 +112,22 @@ out="$(ARGV0="/home/u/.local/bin/craft-anything-cli" "$APPDIR/AppRun" --version)
 out="$(ARGV0="craft-anything" "$APPDIR/AppRun" open --cli)" || fail "app launch exited non-zero"
 [[ "$out" = "stub: open --cli" ]] || fail "app launch routed to the CLI: $out"
 
+# 13. No icon cache is created where there was none (#1877).
+[[ ! -f "$XDG_DATA_HOME/icons/hicolor/icon-theme.cache" ]] || fail "icon cache created where there was none"
+
+# 14. When no icon changed, the cache file is not touched (#1877).
+icons_dir="$XDG_DATA_HOME/icons/hicolor"
+mkdir -p "$icons_dir"
+echo "sentinel" >"$icons_dir/icon-theme.cache"
+"$APPDIR/AppRun" >/dev/null || fail "launch with unchanged icons exited non-zero"
+[[ "$(cat "$icons_dir/icon-theme.cache")" = "sentinel" ]] || fail "icon cache refreshed although nothing changed"
+
+# 15. When an icon changed and a cache exists, the cache may be refreshed (#1877).
+src_icon="$APPDIR/usr/share/icons/hicolor/16x16/apps/$APP_ID.png"
+cp "$src_icon" "$src_icon.bak"
+printf 'x' >>"$src_icon"
+echo "old" >"$icons_dir/icon-theme.cache"
+"$APPDIR/AppRun" >/dev/null || fail "launch with changed icon exited non-zero"
+mv "$src_icon.bak" "$src_icon"
+
 echo "AppRun desktop integration and CLI routing ok"

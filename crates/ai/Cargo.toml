@@ -22,6 +22,8 @@ log = { workspace = true }
 regex = { workspace = true }
 toml = { workspace = true }
 ureq = "3"
+# Pictures are sent to models as base64 (the same version the engine crate uses).
+base64 = "0.22"
 dirs = "6"
 
 [target.'cfg(target_os = "linux")'.dependencies]

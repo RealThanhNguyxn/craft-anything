@@ -1,9 +1,6 @@
 # Releasing Craft Anything
 
-The recipe is shared by every Crafting App: `release/playbook.md` in
-[craftrules](https://github.com/storytold/craftrules) (`../craftrules`), and the runbook for cutting
-one is `release/cut-a-release.md` there. That repo is private; you don't need it to follow this
-page. In short: a release is whatever is on the `release` branch. Pushing to it makes
+A release is whatever is on the `release` branch. Pushing to it makes
 `.github/workflows/release.yml` build, sign and package every platform and attach the files to a
 draft GitHub Release, which a maintainer publishes once every job is green. Signing needs the
 maintainers' certificates (secrets of the `release` environment, which only the `release` branch can read), so a fork's run produces unsigned packages.

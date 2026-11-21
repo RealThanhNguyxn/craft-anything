@@ -105,3 +105,28 @@ a plugin exports the interfaces at the version it was built against
 Code that defines tools at run time itself (a WASM host, a proxy for another protocol) uses
 `registry::RuntimeTool` with `Engine::shared_with`: owned names, a JSON schema, and a function that
 serves its tools, telling them apart by `ctx.tool`.
+
+## Workspace map
+
+```text
+crates/
+  evidence   L0  Evidence records, canonical ids, confidence, unknowns, ToolError (the error contract)
+  formats    L0  Standalone parsers (no workspace deps, no I/O): ELF/PE/Mach-O/WASM/DEX/APK/ASAR/plist/.NET/Go/…
+  disasm     L1  Our own native engine (Clean room): decode, functions, CFG, xrefs, call graph, pseudo-C
+  js         L1  JavaScript/Electron/web bundles: parse, module graph, IPC, source maps, unbundling
+  analysis   L2  Analyzers producing evidence (triage, dossiers, trace, compare, app graph, rebuild ledger)
+  platform   L2  Native services: owned processes, PTY capture, sandbox, engine store, atomic files
+  engines    L3  Optional external engines: Ghidra bridge (Deep mode), adb, CDP, Frida, JADX, Apktool…
+  engine     L4  Session, projects (.cany), workspaces (what the person is making), the inbox
+                 (questions/approvals), ToolSpec registry, settings, consent, the tool list
+  ai         L5  AI backends (Anthropic, OpenAI, OpenRouter, local, agent CLIs, SSH) + agent loop + crews,
+                 and the rebuild workflow (study → build → check → refine)
+  mcp        L5  MCP server: progressive toolsets, resources, prompts
+  setup      L5  Connect to coding-agent apps; doctor; uninstall
+  ui-egui    L6  The egui interface (Beginner + Experienced). The only crate that may use egui/eframe/winit/rfd.
+  testkit        Test helpers and synthetic sample builders
+apps/  craft-anything (desktop) · craft-anything-cli (CLI + `mcp`) · craft-anything-web (browser viewer)
+xtask/ cargo xtask layers | fmt [--check] | tools [--check] | wasm | secrets [--history] | ci | version [set X.Y.Z]
+```
+
+Layering is enforced by `cargo xtask layers`.

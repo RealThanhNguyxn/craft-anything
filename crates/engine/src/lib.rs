@@ -7,11 +7,15 @@
 
 pub mod clean_room;
 
-/// Tools an agent app may be told to approve on its own side (Codex's `approval_mode`): each one
-/// asks the person itself (`Effects::needs_consent`), so approving it there skips nothing.
-/// Everything else keeps the app's own policy; a test in the AI crate checks each is registered
-/// and asks for consent.
-pub const AGENT_APP_PREAPPROVED_TOOLS: &[&str] = &["rebuild_start"];
+/// Tools an agent app may be told to approve on its own side (Codex's `approval_mode`), because
+/// we limit each one ourselves, so approving it there skips nothing: `rebuild_start` asks the
+/// person (`Effects::needs_consent`), and the asset tools run only when the person turned on
+/// generated assets for the project, within its budget, asking before going over it (#1464).
+/// Everything else keeps the app's own policy; a test in the AI crate checks each is registered.
+pub const AGENT_APP_PREAPPROVED_TOOLS: &[&str] = &["rebuild_start", ASSETS_SPENDING_TOOLS[0], ASSETS_SPENDING_TOOLS[1]];
+
+/// The tools that spend the person's money on generated assets, within the project's budget.
+pub const ASSETS_SPENDING_TOOLS: [&str; 2] = ["assets_image_generate", "assets_model_generate"];
 pub mod failure_log;
 pub mod feed;
 pub mod inbox;

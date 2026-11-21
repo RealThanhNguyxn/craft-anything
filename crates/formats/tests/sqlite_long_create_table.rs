@@ -20,7 +20,7 @@ fn a_long_create_table_keeps_its_later_columns_and_rowid_alias() {
     record.push(Val::Text("end".into()));
     let data = table_db(&sql, &[(7, record)]);
     let db = SqliteDb::parse(&data).unwrap();
-    let (schema, _) = db.schema();
+    let (schema, ..) = db.schema();
     let names: Vec<_> = schema[0].columns.iter().map(|column| column.name.as_str()).collect();
     assert_eq!(names.len(), 472);
     assert_eq!((names[0], names[471]), ("id", "last"));

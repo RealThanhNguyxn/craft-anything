@@ -192,7 +192,7 @@ setup) รองรับโปรแกรมแบบเนทีฟ, .NET, Ja
 แอปเดสก์ท็อปต้องติดตั้งแพ็กเกจเหล่านี้เพิ่มเติม:
 
 ```sh
-sudo apt-get install libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev libgtk-3-dev
+sudo apt-get install build-essential libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev libgtk-3-dev
 ```
 
 จากนั้น:

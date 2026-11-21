@@ -241,7 +241,10 @@ fn error_text(e: &ToolError) -> String {
 }
 
 /// Consent waiters shared between the worker and the UI-facing handle.
-type Waiters = Arc<Mutex<HashMap<String, Sender<bool>>>>;
+type Waiters = Arc<Mutex<HashMap<String, Sender<Answer>>>>;
+
+/// A consent answer: allowed, or refused, with why when nobody was asked (`None`: the person said no).
+type Answer = Result<(), Option<String>>;
 
 /// One model with its display name (a link in a fallback chain).
 pub struct ModelSlot {
@@ -277,25 +280,29 @@ pub struct LoopConfig {
     /// Where a model turn that failed writes a failure log (`logs/` in the config folder), as an
     /// agent CLI's failure does. `None`: no log (a test, or a fork's loop).
     pub logs: Option<std::path::PathBuf>,
+    /// A build's notes folder ([`crate::rebuild::notes`]): after each tool step the notes waiting
+    /// there are claimed and added after the results, so the builder reads them at its next step,
+    /// as a coding agent's hook hands them over. `None`: notes wait for the turn to end.
+    pub notes: Option<std::path::PathBuf>,
 }
 
 impl Default for LoopConfig {
     /// Deep, so a conversation started without an explicit mode keeps the old, safe behavior.
     fn default() -> Self {
-        Self { beginner: false, prices: BTreeMap::new(), transcript: None, deep: true, context_tokens: 0, lean_for_local: false, logs: None }
+        Self { beginner: false, prices: BTreeMap::new(), transcript: None, deep: true, context_tokens: 0, lean_for_local: false, logs: None, notes: None }
     }
 }
 
-/// A log of a model turn that stopped, beside the agent CLIs' failure logs: the backend, what the
-/// server said and what to do about it. `None` when nothing could be written; the error itself is
-/// still shown.
+/// A log of a model turn that stopped, beside the agent CLIs' failure logs: the backend, what
+/// [`logged_error`] keeps of the error and what to do about it. `None` when nothing could be
+/// written; the error itself is still shown.
 fn write_failure_log(dir: &std::path::Path, backend: &str, e: &ToolError) -> Option<std::path::PathBuf> {
     let report = crate::failure_log::Report {
         what: format!("{backend}: a model turn stopped"),
         command: "the model request: no program ran".into(),
         check: format!("craft-anything-cli ai test {backend:?}"),
         diagnosis: e.remediation.clone(),
-        error: Some(format!("{} ({:?})", e.message, e.code)),
+        error: Some(logged_error(e)),
         ..Default::default()
     };
     match crate::failure_log::write(dir, &report) {
@@ -305,6 +312,34 @@ fn write_failure_log(dir: &std::path::Path, backend: &str, e: &ToolError) -> Opt
             None
         }
     }
+}
+
+/// What a failure log keeps of an API error: Craft Anything's code for it, the HTTP status, the
+/// service's error code when it is a known one ([`crate::failure::KNOWN_PROVIDER_ERRORS`], written
+/// from that list), and the context window and request size the service gave. The service's
+/// message is left out, and so is a code that isn't known: a service, or a proxy in front of it,
+/// can repeat the key or words from the request in either. The person saw the message with the
+/// error.
+fn logged_error(e: &ToolError) -> String {
+    let field = |k: &str| e.details.as_ref().and_then(|d| d.get(k));
+    let number = |k: &str| field(k).and_then(Value::as_u64);
+    let mut s = format!("{:?} (the service's message is left out)", e.code);
+    if let Some(status) = number("status") {
+        s.push_str(&format!("\nHTTP status: {status}"));
+    }
+    if let Some(sent) = field("provider_error").and_then(Value::as_str) {
+        match crate::failure::KNOWN_PROVIDER_ERRORS.iter().find(|known| **known == sent) {
+            Some(known) => s.push_str(&format!("\nThe service's error code: {known}")),
+            None => s.push_str("\nThe service's error code: not a known one, so it is left out"),
+        }
+    }
+    if let Some(window) = number("context_window") {
+        s.push_str(&format!("\nContext window: {window} tokens"));
+    }
+    if let Some(tokens) = number("prompt_tokens") {
+        s.push_str(&format!("\nThe request: {tokens} tokens"));
+    }
+    s
 }
 
 /// The Core tools a builder on a local model keeps. The Core set is 25-odd tools for studying a
@@ -539,7 +574,12 @@ impl AgentLoop {
                 }
                 StopReason::ToolUse if !uses.is_empty() => {
                     self.history.push(result.message);
-                    let results = self.run_tools(&uses);
+                    let mut results = self.run_tools(&uses);
+                    // Notes the person added meanwhile go with the results, after them (every call
+                    // keeps its result first); the build relays them to the feed as read.
+                    if let Some(text) = self.cfg.notes.as_deref().and_then(|dir| crate::rebuild::notes::context(&crate::rebuild::notes::claim(dir))) {
+                        results.push(Block::Text { text });
+                    }
                     self.history.push(Msg { role: Speaker::User, blocks: results });
                     self.save_transcript();
                     if self.failed_builds >= MAX_FAILED_BUILDS {
@@ -675,8 +715,13 @@ impl AgentLoop {
         self.emit(AgentEvent::Status { text: "Making room: summarising the earlier work…".into() });
         let messages = context::with_summary_request(&self.history[..cut]);
         let req = TurnRequest { system, messages: &messages, tools: &[], effort: Effort::Low, max_tokens: crate::anthropic::MAX_TOKENS };
-        let stop = self.stop.clone();
-        let summary = self.chain.get_mut(self.current).map(|slot| slot.model.turn(&req, &mut |_| {}, &stop));
+        let (stop, events) = (self.stop.clone(), self.events.clone());
+        let say = &mut |d| {
+            if let Delta::Status(text) = d {
+                let _ = events.send(AgentEvent::Status { text });
+            }
+        };
+        let summary = self.chain.get_mut(self.current).map(|slot| slot.model.turn(&req, say, &stop));
         let mut accounted = None;
         let text = match summary {
             Some(Ok(r)) => {
@@ -751,11 +796,15 @@ impl AgentLoop {
             let slot = self.chain.get_mut(self.current)?;
             let r = slot.model.turn(
                 &req,
-                &mut |d| {
-                    if let Delta::Text(t) = d {
+                &mut |d| match d {
+                    Delta::Text(t) => {
                         produced = true;
                         let _ = events.send(AgentEvent::TextDelta { text: t });
                     }
+                    Delta::Status(text) => {
+                        let _ = events.send(AgentEvent::Status { text });
+                    }
+                    Delta::Thinking(_) => {}
                 },
                 &stop,
             );
@@ -808,8 +857,8 @@ impl AgentLoop {
                         continue;
                     }
                     *self.failure.lock().unwrap_or_else(PoisonError::into_inner) = Some(TurnFailure::from_api(&e));
-                    // The agent CLIs write a log of a failed run; an API backend does the same, so the
-                    // server's own words can be read afterwards.
+                    // The agent CLIs write a log of a failed run; an API backend does the same, with
+                    // what `logged_error` keeps of the error.
                     let log = self.cfg.logs.clone().and_then(|dir| write_failure_log(&dir, &name, &e));
                     self.emit(AgentEvent::Error { message: format!("{name}: {}", e.message), remediation: e.remediation, log });
                     return None;
@@ -884,9 +933,11 @@ impl AgentLoop {
             && e.code == ErrorCode::ConsentRequired
         {
             r = match self.ask_consent(call_id, name, &e.message) {
-                Some(true) => self.host.call(name, input, true, cancel),
-                Some(false) => Err(ToolError::new(ErrorCode::ConsentRequired, "The user said no to running this tool.")
+                Some(Ok(())) => self.host.call(name, input, true, cancel),
+                Some(Err(None)) => Err(ToolError::new(ErrorCode::ConsentRequired, "The user said no to running this tool.")
                     .with_remediation("Find another way that doesn't run code or change a device, or explain why it's needed.")),
+                Some(Err(Some(why))) => Err(ToolError::new(ErrorCode::ConsentRequired, why)
+                    .with_remediation("Find another way, or tell the person what this tool would have done and why it's needed.")),
                 None => Err(ToolError::cancelled()),
             };
         }
@@ -910,7 +961,7 @@ impl AgentLoop {
     }
 
     /// Ask the UI and wait (this worker thread only) for the answer; `None` when stopped.
-    fn ask_consent(&mut self, call_id: &str, tool: &str, explanation: &str) -> Option<bool> {
+    fn ask_consent(&mut self, call_id: &str, tool: &str, explanation: &str) -> Option<Answer> {
         let (tx, rx) = std::sync::mpsc::channel();
         self.waiters.lock().unwrap_or_else(PoisonError::into_inner).insert(call_id.to_string(), tx);
         self.emit(AgentEvent::ConsentNeeded {
@@ -924,13 +975,13 @@ impl AgentLoop {
         self.waiters.lock().unwrap_or_else(PoisonError::into_inner).remove(call_id);
         self.host.journal(
             "consent",
-            json!({"tool": tool, "call_id": call_id, "state": match answer { Some(true) => "allowed", Some(false) => "declined", None => "stopped" }}),
+            json!({"tool": tool, "call_id": call_id, "state": match answer { Some(Ok(())) => "allowed", Some(Err(None)) => "declined", Some(Err(Some(_))) => "refused", None => "stopped" }}),
         );
         answer
     }
 }
 
-fn wait_answer(rx: &Receiver<bool>, stop: &Stop) -> Option<bool> {
+fn wait_answer(rx: &Receiver<Answer>, stop: &Stop) -> Option<Answer> {
     loop {
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(a) => return Some(a),
@@ -1054,7 +1105,13 @@ impl Conversation for ApiConversation {
 
     fn answer_consent(&mut self, call_id: &str, allow: bool) {
         if let Some(tx) = self.waiters.lock().unwrap_or_else(PoisonError::into_inner).remove(call_id) {
-            let _ = tx.send(allow);
+            let _ = tx.send(if allow { Ok(()) } else { Err(None) });
+        }
+    }
+
+    fn refuse_consent(&mut self, call_id: &str, why: &str) {
+        if let Some(tx) = self.waiters.lock().unwrap_or_else(PoisonError::into_inner).remove(call_id) {
+            let _ = tx.send(Err(Some(why.to_string())));
         }
     }
 
@@ -1303,6 +1360,7 @@ pub(crate) mod tests {
                 ),
                 turn(vec![Block::ToolUse { id: "e".into(), name: "danger".into(), input: json!({}) }], StopReason::ToolUse),
                 turn(vec![Block::ToolUse { id: "f".into(), name: "danger".into(), input: json!({}) }], StopReason::ToolUse),
+                turn(vec![Block::ToolUse { id: "g".into(), name: "danger".into(), input: json!({}) }], StopReason::ToolUse),
                 turn(vec![Block::Text { text: "done".into() }], StopReason::EndTurn),
             ]),
             seen: seen.clone(),
@@ -1316,10 +1374,14 @@ pub(crate) mod tests {
         let events = drain_until_done(&mut c, |e, c| {
             if let AgentEvent::ConsentNeeded { call_id, .. } = e {
                 asked += 1;
-                c.answer_consent(call_id, call_id == "e");
+                if call_id == "g" {
+                    c.refuse_consent(call_id, "Nobody was asked: this run doesn't ask");
+                } else {
+                    c.answer_consent(call_id, call_id == "e");
+                }
             }
         });
-        assert_eq!(asked, 2);
+        assert_eq!(asked, 3);
         let seen = seen.lock().unwrap();
         // turn 1: danger not enabled → error, no consent asked
         let r1 = seen[1].last().unwrap();
@@ -1332,6 +1394,10 @@ pub(crate) mod tests {
         // turn 3 allowed, turn 4 declined
         assert!(matches!(&seen[3].last().unwrap().blocks[0], Block::ToolResult { is_error: false, .. }));
         assert!(matches!(&seen[4].last().unwrap().blocks[0], Block::ToolResult { is_error: true, content, .. } if content.contains("said no")));
+        // turn 5 refused without asking (#1938): the model gets the reason, not "said no"
+        assert!(
+            matches!(&seen[5].last().unwrap().blocks[0], Block::ToolResult { is_error: true, content, .. } if content.contains("Nobody was asked") && !content.contains("said no"))
+        );
         let calls = host.calls.lock().unwrap().clone();
         assert!(calls.contains(&("danger".into(), true)));
         assert!(events.iter().any(|e| matches!(e, AgentEvent::TextDelta { text } if text == "done")));
@@ -1339,7 +1405,7 @@ pub(crate) mod tests {
         for kind in ["user_message", "model_turn", "consent"] {
             assert!(j.iter().any(|(k, _)| k == kind));
         }
-        assert!(matches!(events.last(), Some(AgentEvent::TurnDone { input_tokens: 50, .. })));
+        assert!(matches!(events.last(), Some(AgentEvent::TurnDone { input_tokens: 60, .. })));
         // cost known for the priced model id
         assert!(matches!(events.last(), Some(AgentEvent::TurnDone { cost_usd: Some(_), .. })));
     }
@@ -1385,6 +1451,49 @@ pub(crate) mod tests {
         let events = run(turns);
         assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })), "{events:?}");
         assert!(events.iter().any(|e| matches!(e, AgentEvent::TextDelta { text } if text == "done")));
+    }
+
+    /// A note the person adds while an API-backend builder works reaches it at its next step,
+    /// after that step's tool results, and is claimed so the build doesn't send it again after
+    /// the turn. Without a notes folder the note waits.
+    #[test]
+    fn a_note_reaches_an_api_builder_between_tool_calls() {
+        use crate::rebuild::notes;
+        let run = |dir: Option<std::path::PathBuf>| {
+            let host = Arc::new(FakeHost { calls: Mutex::default(), journal: Mutex::default() });
+            let seen: Arc<Mutex<Vec<Vec<Msg>>>> = Arc::default();
+            let turns = VecDeque::from([
+                turn(vec![Block::ToolUse { id: "b1".into(), name: BUILD_COMMAND_TOOL.into(), input: json!({"ok": true}) }], StopReason::ToolUse),
+                turn(vec![Block::Text { text: "done".into() }], StopReason::EndTurn),
+            ]);
+            let slot = ModelSlot {
+                name: "Fake".into(),
+                model: Box::new(Scripted { turns, seen: seen.clone() }),
+                local: false,
+                effort: None,
+                max_turns: 10,
+                context_tokens: 0,
+                tools: Default::default(),
+            };
+            let mut c = ApiConversation::start(host, vec![slot], LoopConfig { notes: dir, ..LoopConfig::default() }).unwrap();
+            c.send("build it");
+            drain_until_done(&mut c, |_, _| {});
+            let last = seen.lock().unwrap().get(1).and_then(|m| m.last().cloned()).expect("a second request");
+            last.blocks
+        };
+        let d = tempfile::tempdir().unwrap();
+        let dir = notes::notes_dir(d.path());
+        notes::hand_over(&dir, 7, "make it blue", None).unwrap();
+        let blocks = run(Some(dir.clone()));
+        assert!(matches!(&blocks[0], Block::ToolResult { tool_use_id, .. } if tool_use_id == "b1"), "the result comes first: {blocks:?}");
+        assert!(matches!(&blocks[1], Block::Text { text } if text.contains("- make it blue") && text.contains("while you were working")), "{blocks:?}");
+        assert!(notes::was_read(&dir, 7), "claimed, so it goes to the feed and not into the next message");
+        // Nothing waiting: the results alone.
+        assert_eq!(run(Some(dir.clone())).len(), 1);
+        // No folder (a chat, the extractor): a waiting note stays for after the turn.
+        notes::hand_over(&dir, 8, "add a footer", None).unwrap();
+        assert_eq!(run(None).len(), 1);
+        assert!(!notes::was_read(&dir, 8));
     }
 
     #[test]
@@ -1696,7 +1805,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// A failing backend says where its log is, and the log holds the server's words.
+    /// A failing backend says where its log is, and the log holds the HTTP status without the
+    /// server's words.
     #[test]
     fn a_failing_backend_writes_a_log_and_says_where_it_is() {
         let dir = tempfile::tempdir().unwrap();
@@ -1724,20 +1834,22 @@ pub(crate) mod tests {
             .expect("the error names its log");
         assert!(log.starts_with(&logs), "{log:?}");
         let text = std::fs::read_to_string(&log).unwrap();
-        assert!(text.contains("Local: a model turn stopped") && text.contains("503"), "{text}");
+        assert!(text.contains("Local: a model turn stopped") && text.contains("HTTP status: 503"), "{text}");
+        assert!(!text.contains("busy"), "{text}");
     }
 
     /// The agent CLIs write a log of a failed run; a model turn that stopped on an API backend
-    /// does the same, with the server's words and the fix.
+    /// does the same, with the error's code and the fix, and without the server's words.
     #[test]
     fn a_stopped_model_turn_writes_a_failure_log() {
         let dir = tempfile::tempdir().unwrap();
         let e = ToolError::new(ErrorCode::ProgramFailed, "the server said 503").with_remediation("Try again later.");
         let path = write_failure_log(dir.path(), "Local", &e).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        for part in ["Local: a model turn stopped", "the server said 503", "Try again later.", "ai test"] {
+        for part in ["Local: a model turn stopped", "ProgramFailed", "Try again later.", "ai test"] {
             assert!(text.contains(part), "{part}: {text}");
         }
+        assert!(!text.contains("the server said"), "{text}");
         // Nothing set: no log, and the error still reaches the person.
         assert!(LoopConfig::default().logs.is_none());
     }

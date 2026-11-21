@@ -1,5 +1,6 @@
 # de: original German UI translations (informal "du"). Licensed MIT OR Apache-2.0.
 # UTF-8: English source<TAB>translation. Keep placeholders and escapes intact.
+Default (its own settings)	Standard (eigene Einstellungen)
 OpenCode default	OpenCode-Standard
 Model default	Modellstandard
 Thinking depth	Denktiefe
@@ -304,6 +305,7 @@ Couldn't look through that folder.	Dieser Ordner konnte nicht durchsucht werden.
 Couldn't open it.	Konnte nicht geöffnet werden.
 Couldn't open the folder.	Der Ordner konnte nicht geöffnet werden.
 Couldn't open {}: {}	{} konnte nicht geöffnet werden: {}
+Couldn't save your settings.	Die Einstellungen konnten nicht gespeichert werden.
 Couldn't start a worker thread: {e}	Ein Arbeits-Thread konnte nicht gestartet werden: {e}
 Couldn't start it.	Konnte nicht gestartet werden.
 Coverage unknown	Abdeckung unbekannt
@@ -696,6 +698,7 @@ Medium	Mittel
 Memory for Ghidra	Speicher für Ghidra
 Minimise	Minimieren
 Mode	Modus
+Text bigger or smaller: Ctrl/⌘ + and Ctrl/⌘ −. Ctrl/⌘ 0 resets it.	Text größer oder kleiner: Strg/⌘ + und Strg/⌘ −. Strg/⌘ 0 setzt ihn zurück.
 Model	Modell
 Model options	Modelloptionen
 Model: {model}	Modell: {model}
@@ -986,6 +989,7 @@ Saved in	Gespeichert in
 Saves space: copies the program and code, and shares dependencies and media with the project. A shared file rewritten in place changes here too.	Spart Platz: kopiert das Programm und den Code und teilt Abhängigkeiten und Medien mit dem Projekt. Eine geteilte Datei, die an Ort und Stelle überschrieben wird, ändert sich auch hier.
 Say what you want	Sag, was du willst
 Say what you want first.	Sag zuerst, was du willst.
+This applies once you choose something to recreate above.	Das gilt, sobald du oben etwas zum Nachbauen auswählst.
 Say what you want to make, or drop an app or file on the window to look inside it. Everything runs in Clean room mode unless you switch on Deep.	Sag, was du machen willst, oder zieh eine App oder Datei auf das Fenster, um hineinzusehen. Alles läuft im Clean-Room-Modus, solange du Deep nicht einschaltest.
 Screenshot	Screenshot
 Screenshot a page	Screenshot einer Seite
@@ -1191,6 +1195,7 @@ Use the projects folder	Den Projektordner verwenden
 Use this	Dieses verwenden
 Use {name}	{name} verwenden
 Value flow	Werteverlauf
+About	Über
 Version	Version
 Waiting	Wartet
 Waiting for another build to finish: this one starts next.	Wartet, bis ein anderer Build fertig ist: Dieser startet als Nächstes.
@@ -1446,6 +1451,7 @@ Zoom	Zoomen
 Bring all to front	Alle nach vorne bringen
 Drag to give the plan more or less room; double-click to reset	Ziehen, um dem Plan mehr oder weniger Platz zu geben; Doppelklick setzt zurück
 Copy the message	Die Nachricht kopieren
+Copy the version	Die Version kopieren
 Choose what the builder's approvals get	Festlegen, was die Freigaben des Builders erhalten
 Reading the web	Im Web lesen
 Other commands	Andere Befehle
@@ -1492,3 +1498,8 @@ You're up to date.	Du bist auf dem neuesten Stand.
 Forget a website sign-in	Anmeldung bei einer Website vergessen
 Sign in to a website	Bei einer Website anmelden
 Some shared files could not be hard-linked and were copied instead ({size}).	Einige geteilte Dateien konnten nicht hart verlinkt werden und wurden kopiert ({size}).
+This server lists several chat models. Choose one:	Dieser Server bietet mehrere Chat-Modelle an. Wähle eines:
+Choose a model	Modell wählen
+
+# Saved-builder notice: English until native-speaker review.
+The AI chosen for this project ({saved}) is turned off or no longer set up. {used} builds instead.	The AI chosen for this project ({saved}) is turned off or no longer set up. {used} builds instead.

@@ -449,7 +449,16 @@ pub fn unescape(s: &str) -> String {
             Some('b') => out.push('\u{8}'),
             Some('f') => out.push('\u{c}'),
             Some('v') => out.push('\u{b}'),
-            Some('0') => out.push('\0'),
+            Some(c @ '0'..='7') => {
+                let mut code = c as u32 - '0' as u32;
+                let extra = if c <= '3' { 2 } else { 1 };
+                for _ in 0..extra {
+                    let Some(d @ '0'..='7') = it.peek().copied() else { break };
+                    it.next();
+                    code = code * 8 + d as u32 - '0' as u32;
+                }
+                out.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
+            }
             Some('x') => {
                 let h: String = it.by_ref().take(2).collect();
                 if let Some(ch) = u32::from_str_radix(&h, 16).ok().and_then(char::from_u32) {
@@ -457,13 +466,26 @@ pub fn unescape(s: &str) -> String {
                 }
             }
             Some('u') => {
-                let hex: String = if it.peek() == Some(&'{') {
+                let code = if it.peek() == Some(&'{') {
                     it.next();
-                    it.by_ref().take_while(|c| *c != '}').take(8).collect()
+                    // Accumulate without allocating: any number of leading zeroes is valid.
+                    let mut value = Some(0u32);
+                    let mut digits = false;
+                    let mut closed = false;
+                    for c in it.by_ref() {
+                        if c == '}' {
+                            closed = true;
+                            break;
+                        }
+                        digits = true;
+                        value = value.and_then(|v| v.checked_mul(16)?.checked_add(c.to_digit(16)?));
+                    }
+                    if digits && closed { value } else { None }
                 } else {
-                    it.by_ref().take(4).collect()
+                    let hex: String = it.by_ref().take(4).collect();
+                    u32::from_str_radix(&hex, 16).ok()
                 };
-                let Ok(mut code) = u32::from_str_radix(&hex, 16) else { continue };
+                let Some(mut code) = code else { continue };
                 if (0xD800..0xDC00).contains(&code) {
                     let mut ahead = it.clone();
                     if ahead.next() == Some('\\') && ahead.next() == Some('u') {
@@ -476,7 +498,7 @@ pub fn unescape(s: &str) -> String {
                 }
                 out.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
             }
-            Some('\n') => {}
+            Some('\n' | '\u{2028}' | '\u{2029}') => {}
             Some('\r') => {
                 if it.peek() == Some(&'\n') {
                     it.next();

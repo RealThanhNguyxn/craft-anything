@@ -46,9 +46,12 @@ Codex's own settings decide this; Craft Anything's consent is a second, separate
 
 ## What we set
 
-Only tools that ask the person themselves are approved on Codex's side
-(`AGENT_APP_PREAPPROVED_TOOLS` in the engine, today just `rebuild_start`; a test checks each one
-asks for consent). Every other tool keeps whatever approval policy you set in Codex.
+Only tools Craft Anything limits itself are approved on Codex's side
+(`AGENT_APP_PREAPPROVED_TOOLS` in the engine): `rebuild_start`, which asks you before it runs a
+coding agent, and `assets_image_generate` and `assets_model_generate`, which run only when you
+turned on generated assets for the project and spend within its budget, asking you before going
+over it (#1464). Every other tool keeps whatever approval policy you set in Codex. If you set up
+Codex before this, run `craft-anything-cli setup --client codex --yes` again to add the asset tools.
 
 So when a build's feed says Codex blocked another of our tools, such as `build_command_run`,
 running setup again changes nothing for it (#1867). To let Codex call it during a build, approve

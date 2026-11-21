@@ -389,7 +389,7 @@ pub(super) fn continue_prompt(kind: &dyn TargetKind, api_loop: bool) -> String {
 /// on from the project rather than starting over.
 pub(super) fn resumed_elsewhere(brief: &str, last_reply: &str, handoff: Option<&str>) -> String {
     let mut s = format!(
-        "{brief}\n\nThis project is already under way: an earlier conversation built it, but that conversation isn't on this computer (the project was started on another computer or in another folder). Everything made so far is in app/. Before changing anything, look through app/ and the open questions (core_unknowns_show) to see what's done, then carry on from there instead of starting again."
+        "{brief}\n\nThis project is already under way: an earlier conversation built it, but that conversation can't be continued: it isn't on this computer (the project was started on another computer or in another folder), or it grew too long. Everything made so far is in app/. Before changing anything, look through app/ and the open questions (core_unknowns_show) to see what's done, then carry on from there instead of starting again."
     );
     if let Some(h) = handoff.map(str::trim).filter(|h| !h.is_empty()) {
         s.push_str(&format!(

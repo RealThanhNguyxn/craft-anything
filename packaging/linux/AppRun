@@ -57,15 +57,27 @@ integrate() {
   fi
 
   # Icons: per-file compare so an unchanged install costs a handful of cmp calls.
+  # Track whether any icon was actually copied so the cache is refreshed only when
+  # something changed (#1877).
   src_icons="$APPDIR/usr/share/icons/hicolor"
   [ -d "$src_icons" ] || return 0
   icons="$data/icons/hicolor"
-  (cd "$src_icons" && find . -type f) | while IFS= read -r rel; do
+  icons_changed=false
+  while IFS= read -r rel; do
     mkdir -p "$icons/$(dirname "$rel")" 2>/dev/null || continue
     if ! cmp -s "$src_icons/$rel" "$icons/$rel"; then
-      cp "$src_icons/$rel" "$icons/$rel" 2>/dev/null || true
+      cp "$src_icons/$rel" "$icons/$rel" 2>/dev/null && icons_changed=true
     fi
-  done
+  done <<EOF
+$(cd "$src_icons" && find . -type f)
+EOF
+  # Refresh the icon cache only when an icon actually changed and the desktop
+  # has already built a cache (don't create one where there is none).
+  if $icons_changed && [ -f "$icons/icon-theme.cache" ]; then
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+      gtk-update-icon-cache -q "$icons" >/dev/null 2>&1 || true
+    fi
+  fi
 }
 
 # The command-line tool ships beside the app but nothing puts it on PATH, and the launcher renames

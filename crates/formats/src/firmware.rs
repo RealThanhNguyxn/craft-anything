@@ -683,7 +683,7 @@ impl<'a> Scanner<'a> {
         let ver = self.r.u16_le(i + 4)?;
         let method = self.r.u16_le(i + 8)?;
         let name_len = usize::from(self.r.u16_le(i + 26)?);
-        if ver > 100 || !matches!(method, 0 | 1 | 6 | 8 | 9 | 12 | 14 | 93 | 95 | 98 | 99) || name_len == 0 || name_len > 1024 || !self.probe("zip") {
+        if ver > 100 || !matches!(method, 0 | 1 | 6 | 8 | 9 | 12 | 14 | 20 | 93 | 95 | 98 | 99) || name_len == 0 || name_len > 1024 || !self.probe("zip") {
             return None;
         }
         let name = String::from_utf8_lossy(self.r.slice(i + 30, name_len)?).into_owned();
@@ -880,31 +880,36 @@ impl<'a> Scanner<'a> {
         let u16f = |o: usize| if be { r.u16_be(i + o) } else { r.u16_le(i + o) };
         let u32f = |o: usize| if be { r.u32_be(i + o) } else { r.u32_le(i + o) };
         let major = u16f(28)?;
-        let block_size = u32f(12)?;
-        let block_log = u16f(22)?;
-        let comp = u16f(20)?;
         if !(2..=4).contains(&major) || !self.probe("squashfs") {
             return None;
         }
-        let (used, conf) = if major == 4 {
+        // The block size, compression and block_log are where version 4 keeps them only: 2.x and
+        // 3.x keep the uid table's start at +12, the inode table's at +20 and the block size at +51,
+        // and name no compression (they wrote gzip).
+        let (used, conf, block_size, compression) = if major == 4 {
+            let (block_size, comp, block_log) = (u32f(12)?, u16f(20)?, u16f(22)?);
             if !(12..=20).contains(&block_log) || 1u32.checked_shl(u32::from(block_log)) != Some(block_size) || !(1..=6).contains(&comp) {
                 return None;
             }
             let used = if be { self.r.u64_be(i + 40)? } else { self.r.u64_le(i + 40)? };
-            (Some(used), "high")
+            let compression = match comp {
+                1 => "gzip",
+                2 => "lzma",
+                3 => "lzo",
+                4 => "xz",
+                5 => "lz4",
+                6 => "zstd",
+                _ => "unknown",
+            };
+            (Some(used), "high", Some(block_size), compression)
         } else {
+            let (block_size, block_log) = (u32f(51)?, u16f(34)?);
+            if !(12..=20).contains(&block_log) || 1u32.checked_shl(u32::from(block_log)) != Some(block_size) {
+                return None;
+            }
             // Version 3 keeps a 64-bit bytes_used at +63; version 2 a 32-bit one at +8.
             let used = if major == 3 { if be { self.r.u64_be(i + 63) } else { self.r.u64_le(i + 63) } } else { u32f(8).map(u64::from) };
-            (used, "medium")
-        };
-        let compression = match comp {
-            1 => "gzip",
-            2 => "lzma",
-            3 => "lzo",
-            4 => "xz",
-            5 => "lz4",
-            6 => "zstd",
-            _ => "unknown",
+            (used, "medium", Some(block_size), "unknown")
         };
         let used = used.filter(|u| *u >= 96)?;
         let (len, cut) = clamp(used, i, self.data.len());
@@ -916,7 +921,7 @@ impl<'a> Scanner<'a> {
             format!("squashfs {major}.x filesystem ({}-endian, {compression})", if be { "big" } else { "little" }),
             conf,
             Unpack::Filesystem,
-            json!({"version": major, "block_size": block_size, "compression": if major == 4 { compression } else { "unknown" }, "inodes": u32f(4), "bytes_used": used, "truncated": cut}),
+            json!({"version": major, "block_size": block_size, "compression": compression, "inodes": u32f(4), "bytes_used": used, "truncated": cut}),
         ))
     }
 
@@ -1840,6 +1845,77 @@ mod tests {
         bad[n - 1] ^= 1;
         assert!(inflate(&bad, true, 1 << 20, false).is_err());
         assert_eq!(gzip_header(&gz).unwrap().original_name.as_deref(), Some("x.bin"));
+    }
+
+    /// A squashfs 2.x or 3.x superblock: `uid_start` at 12 (where 4.0 keeps its block size), the
+    /// inode table's start at 20, the block size at 51, and the bytes used at 8 (2.x) or 63 (3.x).
+    fn old_squashfs(major: u16, be: bool, uid_start: u32, block_size: u32) -> Vec<u8> {
+        let mut s = vec![0u8; 4096];
+        s[0..4].copy_from_slice(if be { b"sqsh" } else { b"hsqs" });
+        // A `width`-byte number at `at`, in the image's byte order.
+        let mut put = |at: usize, value: u64, width: usize| {
+            let bytes = if be { value.to_be_bytes()[8 - width..].to_vec() } else { value.to_le_bytes()[..width].to_vec() };
+            s[at..at + width].copy_from_slice(&bytes);
+        };
+        put(4, 5, 4);
+        put(12, u64::from(uid_start), 4);
+        // The inode table's start, where version 4 names its compression.
+        put(20, 0x0002_0002, 4);
+        put(28, u64::from(major), 2);
+        put(34, u64::from(block_size.trailing_zeros()), 2);
+        put(51, u64::from(block_size), 4);
+        if major == 3 {
+            put(63, 4096, 8);
+        } else {
+            put(8, 4096, 4);
+        }
+        s
+    }
+
+    #[test]
+    fn an_older_squashfs_reports_the_block_size_it_declares() {
+        for (major, be) in [(3, false), (3, true), (2, false), (2, true)] {
+            let img = old_squashfs(major, be, 0x1234, 65_536);
+            let r = scan(&img, &ScanOptions::default(), &no_stop);
+            let sq = r.regions.iter().find(|x| x.kind == "squashfs").unwrap_or_else(|| panic!("{major} {be}: {:?}", kinds(&r)));
+            assert_eq!(sq.details["version"], major, "{major} {be}");
+            assert_eq!(sq.details["block_size"], 65_536, "{major} {be}: the uid table's start isn't the block size");
+            assert_eq!(sq.length, Some(4096), "{major} {be}");
+            assert_eq!(sq.details["compression"], "unknown", "{major} {be}");
+            assert!(sq.description.ends_with(", unknown)"), "{major} {be}: {}", sq.description);
+        }
+        // A candidate cut before its block size cannot establish the block layout.
+        let cut = &old_squashfs(2, false, 0x1234, 65_536)[..53];
+        let r = scan(cut, &ScanOptions::default(), &no_stop);
+        assert!(!r.regions.iter().any(|x| x.kind == "squashfs"));
+        // Version 4 keeps its block size at 12.
+        let r = scan(&fx::squashfs(4096), &ScanOptions::default(), &no_stop);
+        assert_eq!(r.regions.iter().find(|x| x.kind == "squashfs").unwrap().details["block_size"], 131_072);
+    }
+
+    #[test]
+    fn an_older_squashfs_requires_a_consistent_block_layout() {
+        for (major, be) in [(2, false), (2, true), (3, false), (3, true)] {
+            for block_log in 12..=20 {
+                let block_size = 1u32 << block_log;
+                let img = old_squashfs(major, be, 0x1234, block_size);
+                let r = scan(&img, &ScanOptions::default(), &no_stop);
+                let sq = r.regions.iter().find(|x| x.kind == "squashfs").unwrap();
+                assert_eq!(sq.details["block_size"], block_size);
+            }
+            for (block_size, block_log) in [(0, 16u16), (65_536, 0), (65_536, 15), (65_536, 32), (65_536, u16::MAX), (65_537, 16), (2048, 11), (2_097_152, 21)]
+            {
+                let mut img = old_squashfs(major, be, 0x1234, block_size);
+                img[34..36].copy_from_slice(&if be { block_log.to_be_bytes() } else { block_log.to_le_bytes() });
+                let r = scan(&img, &ScanOptions::default(), &no_stop);
+                assert!(!r.regions.iter().any(|x| x.kind == "squashfs"), "{major} {be}: {block_size} / {block_log}");
+            }
+            let img = old_squashfs(major, be, 0x1234, 65_536);
+            let header_end = if major == 2 { 55 } else { 71 };
+            let r = scan(&img[..header_end], &ScanOptions::default(), &no_stop);
+            let sq = r.regions.iter().find(|x| x.kind == "squashfs").unwrap();
+            assert_eq!(sq.details["truncated"], true, "a validated header still identifies a truncated image");
+        }
     }
 
     #[test]

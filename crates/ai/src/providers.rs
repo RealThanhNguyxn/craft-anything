@@ -97,6 +97,15 @@ pub const PROVIDERS: &[Provider] = &[
         default_model: "meta-llama/Llama-3.3-70B-Instruct-Turbo",
         catalog_id: "deepinfra",
     },
+    Provider {
+        name: "Requesty",
+        kind: BackendKind::OpenaiCompatible,
+        base_url: "https://router.requesty.ai/v1",
+        key_env: "REQUESTY_API_KEY",
+        alt_key_env: None,
+        default_model: "anthropic/claude-opus-5-5",
+        catalog_id: "requesty",
+    },
 ];
 
 impl Provider {
@@ -208,5 +217,17 @@ mod tests {
         assert_eq!(of_base("https://api.deepseek.com/v1/"), Some(&PROVIDERS[1]));
         assert_eq!(of_base("http://127.0.0.1:11434/v1"), None);
         assert_eq!(of_base("https://api.example.test/v1"), None);
+    }
+
+    /// Requesty's key goes to its own host only, not to a look-alike or a plain-HTTP address.
+    #[test]
+    fn requesty_key_goes_to_its_own_host_only() {
+        let p = of_base("https://router.requesty.ai/v1").expect("Requesty row");
+        assert_eq!(p.name, "Requesty");
+        assert_eq!(p.key_env, "REQUESTY_API_KEY");
+        assert!(of_base("http://router.requesty.ai/v1").is_none());
+        assert!(of_base("https://router.requesty.ai.example.test/v1").is_none());
+        let found = env_key_with("https://router.requesty.ai/v1", |name| (name == "REQUESTY_API_KEY").then(|| "k".to_string()));
+        assert_eq!(found.as_deref(), Some("k"));
     }
 }

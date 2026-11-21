@@ -107,7 +107,9 @@ fn native_cutter_command_run(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOut
         return Err(ToolError::invalid("port must be 1–65535"));
     }
     ctx.report(None, format!("cutter: {cmd}"));
-    let (text, truncated) = cutter::command(p.port, &cmd, Duration::from_secs(120))?;
+    // Called once: allowed commands can change the session (a relative seek, a comment, a flag),
+    // so an interrupted call isn't sent again.
+    let (text, truncated) = cutter::command_once(p.port, &cmd, Duration::from_secs(120))?;
     let limit = p.limit.clamp(1, 20_000);
     let total = text.lines().count();
     let page: Vec<&str> = text.lines().skip(p.offset).take(limit).collect();

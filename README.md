@@ -200,7 +200,7 @@ Requires Rust **1.97 or newer** (a dependency needs it; `rustup update`). On Deb
 the desktop app also needs:
 
 ```sh
-sudo apt-get install libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev libgtk-3-dev
+sudo apt-get install build-essential libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev libgtk-3-dev
 ```
 
 Then:

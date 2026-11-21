@@ -86,6 +86,14 @@ fn main() {
     let w = arg(&args, "--width").and_then(|s| s.parse().ok()).unwrap_or(1440.0);
     let h = arg(&args, "--height").and_then(|s| s.parse().ok()).unwrap_or(900.0);
 
+    if want("builder-replacement") {
+        render(&out, "builder-replacement", w, h, scale, || {
+            let mut app = demo::app(demo::engine(Mode::Beginner, true));
+            app.state.make.ai = Some("Previous AI".into());
+            app
+        });
+    }
+
     if want("first-run-welcome") {
         render(&out, "first-run-welcome", w, h, scale, || demo::app(demo::engine(Mode::Beginner, false)));
     }
@@ -248,7 +256,7 @@ fn main() {
             let mut u = craft_anything_engine::workspace::ProjectUsage { work_ms: 725_000, ..Default::default() };
             u.add_turn(1_180_000, 42_000, Some(3.21), true);
             if let Some(root) = a.workspace.as_ref().map(|w| w.root.clone()) {
-                a.usage.insert(root, craft_anything_ui_egui::usage::ProjectClock { saved: u.clone(), since: None });
+                a.usage.insert(root, craft_anything_ui_egui::usage::ProjectClock { saved: u.clone(), since: None, unreadable: false });
             }
             a.session_usage = u;
             a

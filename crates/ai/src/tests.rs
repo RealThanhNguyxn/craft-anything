@@ -329,6 +329,15 @@ fn hub() -> (AiHub, tempfile::TempDir) {
     (h, dir)
 }
 
+/// A hub whose key store never reads the environment, so a test that expects no key is
+/// deterministic even when the machine has the provider's variable set.
+fn hub_without_env() -> (AiHub, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Engine::new(craft_anything_engine::testing::session()));
+    let h = AiHub::with_stores(engine, dir.path().join("config.toml"), KeyStore::file_only_without_env(dir.path().join("ai-keys.toml")));
+    (h, dir)
+}
+
 /// A named backend stays off for chat, including before API or agent setup can run.
 #[test]
 fn disabled_backends_are_refused_when_chat_starts() {
@@ -369,10 +378,10 @@ fn an_api_transcript_is_resumed_only_in_its_mode() {
     let path = dir.path().join("transcript.json");
     let history = vec![crate::model::Msg::user_text("a Deep conversation")];
     crate::context::save(&path, &history, true).unwrap();
-    assert!(h.start_builder(&entry, false, Some(path.clone()), true).unwrap().resumed(), "Deep continues a Deep transcript");
-    assert!(!h.start_builder(&entry, false, Some(path.clone()), false).unwrap().resumed(), "Clean room starts fresh");
+    assert!(h.start_builder(&entry, false, Some(path.clone()), true, None).unwrap().resumed(), "Deep continues a Deep transcript");
+    assert!(!h.start_builder(&entry, false, Some(path.clone()), false, None).unwrap().resumed(), "Clean room starts fresh");
     crate::context::save(&path, &history, false).unwrap();
-    assert!(!h.start_builder(&entry, false, Some(path), true).unwrap().resumed(), "Deep doesn't continue a Clean room transcript");
+    assert!(!h.start_builder(&entry, false, Some(path), true, None).unwrap().resumed(), "Deep doesn't continue a Clean room transcript");
 }
 
 /// Compare checks either position; enabled named and automatic chat choices still work.
@@ -587,6 +596,98 @@ fn an_app_bundle_is_refused_as_an_agents_program() {
     assert_eq!(program(&h).as_deref(), Some("agy"));
 }
 
+/// Two stand-in agents (one on, one off) that write a marker if run, plus an enabled API backend
+/// with no key: constructing that one would fail with "no API key" without doing any I/O.
+#[cfg(unix)]
+fn off_on_and_no_key_backends() -> (AiHub, tempfile::TempDir, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let (h, dir) = hub_without_env();
+    let marker = dir.path().join("ran.txt");
+    let program = |name: &str| {
+        let p = dir.path().join(name);
+        std::fs::write(&p, format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 0\n", marker.display())).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
+        p
+    };
+    let agent = |name: &str, enabled: bool| BackendEntry {
+        config: BackendConfig { name: name.into(), kind: BackendKind::AgentCli, model: "claude".into(), base_url: None, ssh_host: None, enabled },
+        options: BackendOptions { command: Some(program(name).display().to_string()), ..Default::default() },
+    };
+    h.add_backend_with(agent("Off", false), None).unwrap();
+    h.add_backend_with(agent("On", true), None).unwrap();
+    let no_key = BackendConfig {
+        name: "NoKey".into(),
+        kind: BackendKind::Openrouter,
+        model: "test-model".into(),
+        base_url: Some("http://127.0.0.1:9".into()),
+        ssh_host: None,
+        enabled: true,
+    };
+    h.add_backend(no_key, None).unwrap();
+    (h, dir, marker)
+}
+
+/// R2.9: `ai off` says nothing uses an AI, so a named chat must not start one that is turned off.
+#[cfg(unix)]
+#[test]
+fn a_turned_off_ai_is_not_used_by_a_named_chat() {
+    let (h, _d, marker) = off_on_and_no_key_backends();
+    let err = h.start(Some("Off"), true).err().expect("the turned-off agent must not start");
+    assert_eq!(err.code, ErrorCode::BadSettings, "{err:?}");
+    assert!(err.message.contains("turned off"), "{}", err.message);
+    assert!(err.remediation.as_deref().is_some_and(|r| r.contains("Settings") && r.contains("ai on")), "{err:?}");
+    assert!(!marker.exists(), "the turned-off agent ran");
+}
+
+/// The off check covers both names before either comparison conversation runs.
+#[cfg(unix)]
+#[test]
+fn a_comparison_checks_both_names_before_it_starts_either() {
+    let (h, _d, marker) = off_on_and_no_key_backends();
+    for (a, b) in [("Off", "On"), ("On", "Off")] {
+        let err = h.compare(a, b, true).err().expect("a comparison with a turned-off name must not start");
+        assert_eq!(err.code, ErrorCode::BadSettings, "{err:?}");
+        assert!(err.message.contains("turned off"), "{}", err.message);
+        assert!(!marker.exists(), "compare started {a} before checking the other name");
+    }
+}
+
+/// `NoKey` is on but has no key, so constructing it would fail with a key error. The off name
+/// must be reported first, in either order, without building the other conversation.
+#[cfg(unix)]
+#[test]
+fn a_comparison_does_not_build_the_other_backend_before_rejecting_the_off_one() {
+    let (h, _d, _marker) = off_on_and_no_key_backends();
+    // The fixture's store ignores OPENROUTER_API_KEY, so this canary is deterministic.
+    let err = h.start(Some("NoKey"), true).err().expect("NoKey is meant to have no key");
+    assert!(err.message.contains("no API key"), "the test store must ignore the environment: {err:?}");
+    for (a, b) in [("NoKey", "Off"), ("Off", "NoKey")] {
+        let err = h.compare(a, b, true).err().expect("a comparison with a turned-off name must not start");
+        assert_eq!(err.code, ErrorCode::BadSettings, "{err:?}");
+        assert!(err.message.contains("turned off"), "compare built {a} before checking the off name: {err:?}");
+        assert!(!err.message.contains("no API key"), "construction was attempted: {err:?}");
+    }
+}
+
+/// A named backend that is turned off is refused before its key is looked up: the message is
+/// about the choice, not about a key the person may not have.
+#[test]
+fn a_turned_off_api_backend_is_refused_before_its_key() {
+    let (h, _d) = hub_without_env();
+    let off = BackendConfig {
+        name: "Off".into(),
+        kind: BackendKind::Openrouter,
+        model: "test-model".into(),
+        base_url: Some("http://127.0.0.1:9".into()),
+        ssh_host: None,
+        enabled: false,
+    };
+    h.add_backend(off, None).unwrap();
+    let err = h.start(Some("Off"), true).err().expect("the turned-off API backend must not start");
+    assert_eq!(err.code, ErrorCode::BadSettings, "{err:?}");
+    assert!(err.message.contains("turned off"), "the key was looked up first: {err:?}");
+}
+
 /// #423: a saved AI that is switched off isn't set up, so a copy found on the computer is offered
 /// again (to be turned on); one that is on is left out.
 #[test]
@@ -649,13 +750,38 @@ fn an_ais_model_is_changed() {
     let claude =
         BackendConfig { name: "Claude Code".into(), kind: BackendKind::AgentCli, model: "claude-code".into(), base_url: None, ssh_host: None, enabled: true };
     h.add_backend(claude, None).unwrap();
-    assert_eq!(h.model_choices("Claude Code").unwrap(), crate::anthropic::MODELS);
+    assert_eq!(
+        h.model_choices("Claude Code").unwrap(),
+        [crate::anthropic::CLAUDE_CODE_DEFAULT, "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1"]
+    );
     assert!(h.set_model("Claude Code", "claude-sonnet-5-5").unwrap());
     let claude = h.options().get("Claude Code").and_then(|o| o.cli_model.clone());
     assert_eq!(claude.as_deref(), Some("claude-sonnet-5-5"), "the CLI is asked for it; the agent stays Claude Code");
     assert_eq!(h.backends().into_iter().find(|b| b.name == "Claude Code").unwrap().model, "claude-code");
+    // A custom model id the catalogue doesn't list, as a person's Claude Code settings may name.
+    assert!(h.set_model("Claude Code", "my-custom-model").unwrap());
+    assert_eq!(h.options().get("Claude Code").and_then(|o| o.cli_model.clone()).as_deref(), Some("my-custom-model"));
+    // "default" clears the choice: no --model is passed, so Claude Code uses its own settings.
+    assert!(h.set_model("Claude Code", crate::anthropic::CLAUDE_CODE_DEFAULT).unwrap());
+    assert_eq!(h.options().get("Claude Code").and_then(|o| o.cli_model.clone()), None);
     assert!(!h.set_model("Nobody", "m").unwrap());
     assert!(h.set_model("Box", " ").is_err());
+    // #2109: Codex takes a model the same way, and its default clears it, so no -m is passed.
+    let codex = BackendConfig { name: "Codex".into(), kind: BackendKind::AgentCli, model: "codex".into(), base_url: None, ssh_host: None, enabled: true };
+    h.add_backend(codex, None).unwrap();
+    assert!(h.set_model("Codex", "first").unwrap());
+    assert_eq!(h.options().get("Codex").and_then(|o| o.cli_model.clone()).as_deref(), Some("first"));
+    assert!(h.set_model("Codex", crate::anthropic::CLAUDE_CODE_DEFAULT).unwrap());
+    assert_eq!(h.options().get("Codex").and_then(|o| o.cli_model.clone()), None);
+
+    // The Claude Code adapter is also registered as `claude`; the default must clear for that id
+    // too, or a run would pass `--model default` (#470 review).
+    let alias = BackendConfig { name: "Claude".into(), kind: BackendKind::AgentCli, model: "claude".into(), base_url: None, ssh_host: None, enabled: true };
+    h.add_backend(alias, None).unwrap();
+    assert!(h.set_model("Claude", "my-custom-model").unwrap());
+    assert_eq!(h.options().get("Claude").and_then(|o| o.cli_model.as_deref()), Some("my-custom-model"));
+    assert!(h.set_model("Claude", crate::anthropic::CLAUDE_CODE_DEFAULT).unwrap());
+    assert_eq!(h.options().get("Claude").and_then(|o| o.cli_model.clone()), None);
 }
 
 /// Every Claude effort level can be chosen for the Claude API and Claude Code, and only for them.
@@ -908,7 +1034,8 @@ pub(crate) fn serve_routes(routes: &'static [(&'static str, &'static str)]) -> S
 
 /// #1434: FastFlowLM's `/models` lists every model it can download; taking the first started a
 /// 5.5 GB download and unloaded the model in use. A chat model the server says is loaded comes
-/// first; without `/api/ps`, or with nothing loaded, the first chat model listed is still used.
+/// first; without `/api/ps`, or with nothing loaded, the person chooses between several chat
+/// models, and the only one is used.
 #[test]
 fn a_server_added_without_a_model_gets_the_one_it_has_loaded() {
     let (h, _d) = hub();
@@ -920,9 +1047,21 @@ fn a_server_added_without_a_model_gets_the_one_it_has_loaded() {
     assert_eq!(h.add_server("Npu", &flm, None, None).unwrap(), "qwen3.8-mtp-uncensored:27b", "the loaded chat model, not an embedding one");
     assert_eq!(h.add_server("Named", &flm, Some("gemma3:1b"), None).unwrap(), "gemma3:1b", "a named model still wins");
     let idle = serve_routes(&[("/v1/models", CATALOGUE), ("/api/ps", r#"{"models":[]}"#)]);
-    assert_eq!(h.add_server("Idle", &idle, None, None).unwrap(), "deepseek-r1:8b", "nothing loaded: the list's first");
     let no_ps = serve_routes(&[("/v1/models", CATALOGUE)]);
-    assert_eq!(h.add_server("Studio", &no_ps, None, None).unwrap(), "deepseek-r1:8b", "no /api/ps: the list's first");
+    for (name, url) in [("Idle", &idle), ("Studio", &no_ps)] {
+        let e = h.add_server(name, url, None, None).unwrap_err();
+        assert_eq!(e.code, ErrorCode::BadInput, "{name}: {e:?}");
+        assert_eq!(models_to_choose(&e), ["deepseek-r1:8b", "gemma3:1b", "qwen3.8-mtp-uncensored:27b"], "{name}");
+        assert!(e.message.contains("lists 3 chat models"), "{e:?}");
+        assert!(e.remediation.as_deref().is_some_and(|r| r.contains("deepseek-r1:8b, gemma3:1b")), "{e:?}");
+    }
+    assert_eq!(h.add_server("Studio", &no_ps, Some("gemma3:1b"), None).unwrap(), "gemma3:1b", "the chosen one is added");
+    // One chat model beside an embedding one: nothing to choose.
+    let one = serve_routes(&[("/v1/models", r#"{"object":"list","data":[{"id":"nomic-embed-text"},{"id":"qwen3:8b"}]}"#)]);
+    assert_eq!(h.add_server("One", &one, None, None).unwrap(), "qwen3:8b");
+    assert!(models_to_choose(&ToolError::invalid("other")).is_empty(), "other errors offer nothing");
+    let names: Vec<_> = h.backends().into_iter().map(|b| b.name).collect();
+    assert!(!names.iter().any(|n| n == "Idle"), "nothing added while a choice is owed: {names:?}");
 }
 
 /// #54, #98: a server on another computer is added by its address, with a model that can chat
@@ -1113,7 +1252,7 @@ fn anthropic_streaming_tool_loop_through_the_engine() {
     assert_eq!(r1.path, "/v1/messages");
     assert_eq!(r1.header("x-api-key"), Some("sk-test-123"));
     assert_eq!(r1.header("anthropic-version"), Some("2023-06-01"));
-    assert_eq!(r1.header("anthropic-beta"), Some("server-side-fallback-2026-07-01"));
+    assert_eq!(r1.header("anthropic-beta"), Some("thinking-binding-controls-2026-08-01,server-side-fallback-2026-07-01"));
     assert_eq!(r1.header("user-agent"), Some("CraftAnything-dev"));
     let b = &r1.body;
     assert_eq!(b["model"], "claude-opus-5-5");
@@ -1171,6 +1310,53 @@ fn anthropic_refusal_and_http_errors() {
         ev.iter().any(|e| matches!(e, AgentEvent::Error { message, remediation: Some(r), .. } if message.contains("invalid x-api-key") && r.contains("key"))),
         "{ev:?}"
     );
+}
+
+/// A service, or a proxy in front of it, can repeat the key or words from the request in its
+/// error: in a JSON error's message, type or code, in a plain-text body, or in a stream's error
+/// event. None of it reaches the failure log, in the error, the service's code or the advice. The
+/// marker is written like an error code (lower-case letters and an underscore), so only a list of
+/// known codes keeps it out; a known code is still kept (R5.5).
+#[test]
+fn a_failure_log_leaves_out_what_the_service_repeats_of_the_key_and_the_request() {
+    let key = "sk-test-reflected-key";
+    let marker = "quokka_umbrella";
+    let reflected = format!("key {key} may not ask about the {marker}");
+    let stream_error = |kind: &str| {
+        sse(&[
+            json!({"type":"message_start","message":{"model":"claude-opus-5-5","usage":{"input_tokens":5}}}),
+            json!({"type":"error","error":{"type":kind,"message":reflected}}),
+        ])
+    };
+    let (url, _seen) = mock(vec![
+        (401, "application/json", json!({"type":"error","error":{"type":marker,"message":reflected}}).to_string()),
+        (400, "application/json", json!({"error":{"code":marker,"message":reflected}}).to_string()),
+        (400, "text/plain", format!("Rejected by the proxy: {reflected}")),
+        (200, "text/event-stream", stream_error(marker)),
+        (200, "text/event-stream", stream_error("invalid_request_error")),
+    ]);
+    let (h, _d) = hub();
+    add(&h, "Claude", BackendKind::Anthropic, &url, Some(key));
+    let mut c = h.start(Some("Claude"), false).unwrap();
+    let unknown = "The service's error code: not a known one";
+    let expected: [&[&str]; 5] = [
+        &["Error: NoPermission", "HTTP status: 401", unknown, "Diagnosis: The API key was rejected"],
+        &["Error: BadInput", "HTTP status: 400", unknown],
+        &["Error: BadInput", "HTTP status: 400"],
+        &["Error: ProgramFailed", unknown, "Diagnosis: Try again"],
+        &["Error: ProgramFailed", "The service's error code: invalid_request_error"],
+    ];
+    for (n, parts) in expected.iter().enumerate() {
+        let ev = run(&mut c, &format!("a question about the {marker}, take {n}"));
+        let log = ev.iter().find_map(|e| if let AgentEvent::Error { log, .. } = e { log.clone() } else { None });
+        let text = std::fs::read_to_string(log.unwrap_or_else(|| panic!("no log for take {n}: {ev:?}"))).unwrap();
+        for hidden in [key, marker, "may not ask"] {
+            assert!(!text.contains(hidden), "take {n}, {hidden}: {text}");
+        }
+        for part in *parts {
+            assert!(text.contains(part), "take {n}, {part}: {text}");
+        }
+    }
 }
 
 #[test]
@@ -1502,6 +1688,87 @@ fn a_qwen_markup_call_to_a_missing_tool_is_answered_and_the_build_goes_on() {
 }
 
 #[test]
+fn a_picture_reaches_each_api_the_way_it_expects() {
+    use crate::model::{Block, Effort, Msg, Speaker, Stop, TurnRequest};
+    let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
+    let data = "iVBORw0KGgoAAAANSUhEUg==";
+    let message = |picture: Block| Msg {
+        role: Speaker::User,
+        blocks: vec![Block::Text { text: "Here's how it looks now. ".into() }, picture, Block::Text { text: "Close the gap.".into() }],
+    };
+    let shown = message(Block::image("now.png", png).unwrap());
+    let resumed = message(Block::Image { media_type: "image/png".into(), name: "now.png".into(), data: String::new() });
+    let note = Block::image_note("now.png");
+
+    // OpenAI-style servers (llama.cpp, LM Studio, Ollama, OpenRouter): the content becomes parts.
+    for react in [false, true] {
+        let reply = chat_sse(&[json!({"choices":[{"delta":{"content":"Done."},"finish_reason":"stop"}]})]);
+        let (url, seen) = mock(vec![(200, "text/event-stream", reply.clone()), (200, "text/event-stream", reply)]);
+        let mut model = openai::OpenAi::compatible("Local", &url, None, "scripted");
+        model.react = react;
+        for messages in [std::slice::from_ref(&shown), std::slice::from_ref(&resumed)] {
+            let request = TurnRequest { system: "S", messages, tools: &[], effort: Effort::Low, max_tokens: 100 };
+            model.turn(&request, &mut |_| {}, &Stop::default()).unwrap();
+        }
+        let seen = seen.lock().unwrap();
+        let sent = |i: usize| seen[i].body["messages"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(
+            sent(0),
+            json!({"role": "user", "content": [
+                {"type": "text", "text": "Here's how it looks now. "},
+                {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{data}")}},
+                {"type": "text", "text": "Close the gap."},
+            ]}),
+            "react={react}"
+        );
+        // Once its bytes are gone, the note goes in its place, and the content is a string again.
+        assert_eq!(sent(1), json!({"role": "user", "content": format!("Here's how it looks now. {note}Close the gap.")}), "react={react}");
+    }
+
+    // Anthropic: an image block with a base64 source.
+    let reply = sse(&[
+        json!({"type":"message_start","message":{"model":"claude-opus-5-5","usage":{"input_tokens":10,"output_tokens":1}}}),
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Done."}}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}),
+        json!({"type":"message_stop"}),
+    ]);
+    let (url, seen) = mock(vec![(200, "text/event-stream", reply.clone()), (200, "text/event-stream", reply)]);
+    let mut model = anthropic::Anthropic::new(Some(&url), "sk-test-123".into(), "claude-opus-5-5");
+    for messages in [std::slice::from_ref(&shown), std::slice::from_ref(&resumed)] {
+        let request = TurnRequest { system: "S", messages, tools: &[], effort: Effort::Low, max_tokens: 100 };
+        model.turn(&request, &mut |_| {}, &Stop::default()).unwrap();
+    }
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen[0].body["messages"][0]["content"][1], json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}}));
+    assert_eq!(seen[1].body["messages"][0]["content"][1], json!({"type": "text", "text": note}));
+}
+
+#[test]
+fn a_message_without_a_picture_is_sent_as_before() {
+    use crate::model::{Block, Msg, Speaker};
+    // Every request that has no picture keeps its plain-string content.
+    let user = Msg { role: Speaker::User, blocks: vec![Block::Text { text: "Hi".into() }] };
+    assert_eq!(openai::messages_json(&user, false), [json!({"role": "user", "content": "Hi"})]);
+    let results = Msg {
+        role: Speaker::User,
+        blocks: vec![Block::ToolResult { tool_use_id: "c1".into(), content: "ok".into(), is_error: false }, Block::Text { text: "Next.".into() }],
+    };
+    assert_eq!(
+        openai::messages_json(&results, false),
+        [json!({"role": "tool", "tool_call_id": "c1", "content": "ok"}), json!({"role": "user", "content": "Next."})]
+    );
+    // A picture after tool results goes in the person's message that follows them.
+    let mut with_picture = results.clone();
+    with_picture.blocks.push(Block::image("now.png", b"\x89PNG\r\n\x1a\n").unwrap());
+    let sent = openai::messages_json(&with_picture, false);
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0]["role"], "tool");
+    assert_eq!(sent[1]["content"][0], json!({"type": "text", "text": "Next."}));
+    assert_eq!(sent[1]["content"][1]["type"], "image_url");
+}
+
+#[test]
 fn json_text_recovery_preserves_non_actions_and_stop_reasons() {
     use crate::model::{Effort, Msg, Stop, StopReason, ToolDef, TurnRequest};
     let tools = [ToolDef { name: "look".into(), description: "Look at a file".into(), schema: json!({"type":"object"}) }];
@@ -1661,6 +1928,42 @@ fn a_key_save_waits_for_another_backend_change() {
     drop(edit);
     worker.join().unwrap().unwrap();
     assert_eq!(h.keys.get("OpenAI").as_deref(), Some("sk-new"));
+}
+
+/// A catalogue that names its API as text keeps its chat models and drops the others; an id with
+/// a control character is dropped rather than shown.
+#[test]
+fn a_model_list_with_a_text_api_keeps_chat_models() {
+    let models = json!({"data":[
+        {"id":"openai/gpt-4o-mini","api":"chat"},
+        {"id":"openai/text-embedding-3-small","api":"embedding"},
+        {"id":"bad\u{1b}[31m","api":"chat"},
+        {"id":"gpt-5.4","api":{"chat-completions":{}}},
+        {"id":"other","api":{"responses":{}}},
+    ]})
+    .to_string();
+    let (url, _) = mock(vec![(200, "application/json", models)]);
+    let list = openai::OpenAi::compatible("Router", &url, None, "").list_models(Duration::from_secs(5)).unwrap();
+    assert_eq!(list, vec!["openai/gpt-4o-mini", "gpt-5.4"]);
+}
+
+/// An entry that says nothing about its API (no "api", or null) is listed; an unknown API text or
+/// shape is not. Whitespace-only ids are dropped, and an id repeated with padding is listed once.
+#[test]
+fn a_model_list_handles_missing_api_and_padded_ids() {
+    let models = json!({"data":[
+        {"id":"openai/gpt-4o-mini"},
+        {"id":"anthropic/claude-sonnet-4-5","api":null},
+        {"id":"made/up","api":"responses"},
+        {"id":"odd/shape","api":42},
+        {"id":"   ","api":"chat"},
+        {"id":null,"api":"chat"},
+        {"id":" openai/gpt-4o-mini ","api":"chat"},
+    ]})
+    .to_string();
+    let (url, _) = mock(vec![(200, "application/json", models)]);
+    let list = openai::OpenAi::compatible("Router", &url, None, "").list_models(Duration::from_secs(5)).unwrap();
+    assert_eq!(list, vec!["openai/gpt-4o-mini", "anthropic/claude-sonnet-4-5"]);
 }
 
 /// #369: when OpenRouter has no provider that supports tools for a model (404 once only those are

@@ -79,15 +79,16 @@ pub enum AiCommand {
     /// CLAUDE_CONFIG_DIR), so this AI uses another account: a full path or one under `~/`, on the
     /// computer it runs on. Leave the path out for its usual folder.
     Folder { name: String, path: Option<String> },
-    /// Set the model an AI uses (Claude Code: the model it's asked for); leave it out to list the
-    /// ones it can use.
+    /// Set the model an AI uses (Claude Code, Codex: the model it's asked for); leave it out to list
+    /// the ones it can use. `default` for Claude Code or Codex passes no model, so it uses the model
+    /// its own settings name (which may be a custom model), rather than a built-in default.
     Model {
         name: String,
         model: Option<String>,
         /// OpenCode thinking variant; only those offered by the selected model are accepted.
         #[arg(long, value_parser = ["low", "medium", "high", "xhigh", "max"])]
         thinking: Option<String>,
-        /// Use OpenCode's default model and thinking depth.
+        /// Use the agent's own default model (OpenCode's default; Claude Code's own settings).
         #[arg(long, conflicts_with_all = ["model", "thinking"])]
         default: bool,
     },
@@ -98,6 +99,10 @@ pub enum AiCommand {
     Effort { name: String, level: Option<String> },
     /// Show or change an API backend's requests per minute. Zero removes the limit.
     RequestRate { name: String, requests_per_minute: Option<u32> },
+    /// Show or choose the tools a builder on an API backend is offered: auto, lean (building only)
+    /// or full (every tool). Auto gives a local model the lean list below a 64k window and every
+    /// tool from there; a paid service always gets every tool.
+    Tools { name: String, list: Option<String> },
     /// Send a tiny request and report latency.
     Test { name: String },
     /// Choose the backend that builds (leave the name out to go back to automatic).
@@ -339,6 +344,21 @@ pub fn ai(cli: &Cli, c: &AiCommand, f: Format) -> u8 {
         AiCommand::Model { name, model, thinking, default } if *default || thinking.is_some() => {
             let depth = thinking.as_deref().and_then(craft_anything_ai::Effort::parse);
             let model = if *default { None } else { model.clone().or_else(|| hub.options().get(name).and_then(|o| o.cli_model.clone())) };
+            // Claude Code keeps no live catalogue, so `--default` is its "no --model" choice:
+            // `set_model` clears the override directly instead of a catalogue selection.
+            let claude_code = *default
+                && hub.backends().iter().any(|b| {
+                    b.name == *name && b.kind == BackendKind::AgentCli && craft_anything_ai::cli_agents::adapter_for(&b.model).ids().contains(&"claude-code")
+                });
+            if claude_code {
+                return match hub.set_model(name, craft_anything_ai::anthropic::CLAUDE_CODE_DEFAULT) {
+                    Ok(found) => {
+                        emit(&json!({"name": name, "model": craft_anything_ai::anthropic::CLAUDE_CODE_DEFAULT, "found": found}), f);
+                        if found { 0 } else { 1 }
+                    }
+                    Err(e) => fail(&e, f),
+                };
+            }
             match hub.set_agent_model(name, model.as_deref(), depth) {
                 Ok(found) => {
                     emit(&json!({"name": name, "model": model, "thinking": depth, "found": found}), f);
@@ -421,6 +441,24 @@ pub fn ai(cli: &Cli, c: &AiCommand, f: Format) -> u8 {
             match result {
                 Ok(rate) => {
                     emit(&json!({"name": name, "requests_per_minute": rate}), f);
+                    0
+                }
+                Err(e) => fail(&e, f),
+            }
+        }
+        AiCommand::Tools { name, list } => {
+            let result = match list.as_deref() {
+                Some(text) => match craft_anything_ai::ToolList::parse(text) {
+                    Some(list) => hub.set_tool_list(name, list).and_then(|_| hub.tool_list(name)),
+                    None => Err(ToolError::invalid(format!("{text:?} isn't a tool list.")).with_remediation("Use auto, lean or full.")),
+                },
+                None => hub.tool_list(name),
+            };
+            match result {
+                Ok((list, by_window)) => {
+                    // What Auto works out to here, so the choice can be made beside it.
+                    let auto = if by_window { "lean below a 64k window, full from there" } else { "full" };
+                    emit(&json!({"name": name, "tools": list.as_str(), "auto": auto}), f);
                     0
                 }
                 Err(e) => fail(&e, f),

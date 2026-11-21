@@ -593,16 +593,19 @@ mod tests {
             cost_usd: cost,
             cost_is_estimate: estimate,
             builder_notice: None,
+            builder_replacement: None,
         };
+        let response = serde_json::to_value(answered(None, false)).unwrap();
+        assert!(response.get("builder_notice").is_none() && response.get("builder_replacement").is_none());
         record_question_usage(&ws, &answered(Some(0.02), true));
-        let u = ws.usage();
+        let u = ws.usage().known().unwrap();
         assert!((u.cost_usd - 0.02).abs() < 1e-9 && u.api_billed_usd == 0.0 && u.priced, "an agent's estimate: {u:?}");
         record_question_usage(&ws, &answered(Some(0.03), false));
-        let u = ws.usage();
+        let u = ws.usage().known().unwrap();
         assert!((u.cost_usd - 0.05).abs() < 1e-9 && (u.api_billed_usd - 0.03).abs() < 1e-9, "a key's charge: {u:?}");
         record_question_usage(&ws, &answered(None, true));
         record_question_usage(&ws, &answered(Some(0.0), true));
-        assert!((ws.usage().cost_usd - 0.05).abs() < 1e-9, "no cost is no change");
+        assert!((ws.usage().known().unwrap().cost_usd - 0.05).abs() < 1e-9, "no cost is no change");
     }
 
     #[test]

@@ -10,6 +10,10 @@ rust-version = "1.97"
 repository = "https://github.com/storytold/craft-anything"
 
 [workspace.dependencies]
+craft-evm = { git = "https://github.com/storytold/craft-libs", rev = "8cbe36c1130d6e2fc868b7022e0cac09b63a5bbd" }
+craft-java-class = { git = "https://github.com/storytold/craft-libs", rev = "d118983bf922ac96c68b885dc55da30435adbc7d" }
+craft-har = { git = "https://github.com/storytold/craft-libs", rev = "d118983bf922ac96c68b885dc55da30435adbc7d" }
+craft-pcap = { git = "https://github.com/storytold/craft-libs", rev = "d9f0ada8b342f2164b0c4d0c831f5d5da30e8713" }
 # internal
 craft-anything-evidence = { path = "crates/evidence" }
 craft-anything-formats = { path = "crates/formats" }
@@ -26,8 +30,27 @@ craft-anything-ui-egui = { path = "crates/ui-egui" }
 craft-anything-testkit = { path = "crates/testkit" }
 
 # external
+# Shared unwrapped standard Base64 encoding; decoding keeps format-specific validation.
+craft-mime = { git = "https://github.com/storytold/craft-libs", rev = "d118983bf922ac96c68b885dc55da30435adbc7d" }
+# Lenient ZIP inspection with all existing compression methods and serialized listings.
+craft-zip = { git = "https://github.com/storytold/craft-libs", rev = "1928693fbb7a4f8e6b945e614b2fac3e181476ea", features = ["lenient", "lenient-bzip2", "lenient-lzma", "lenient-zstd", "serde"] }
+# Shared bounded TAR/CPIO listing, including current compatibility fixes.
+craft-tar = { git = "https://github.com/storytold/craft-libs", rev = "3b8e426a260695af840a2cd79a064d40778f939e", features = ["serde"] }
 # XML plist reader; prerequisite craft-libs #1633 (repin after merge).
-craft-plist = { git = "https://github.com/storytold/craft-libs", rev = "902a722422583d051093679985793fb94b2af26e" }
+craft-elf = { git = "https://github.com/storytold/craft-libs", rev = "d118983bf922ac96c68b885dc55da30435adbc7d", features = ["serde"] }
+craft-pe = { git = "https://github.com/storytold/craft-libs", rev = "d118983bf922ac96c68b885dc55da30435adbc7d", features = ["serde"] }
+craft-macho = { git = "https://github.com/storytold/craft-libs", rev = "d118983bf922ac96c68b885dc55da30435adbc7d", features = ["serde"] }
+craft-jsonc = { git = "https://github.com/storytold/craft-libs", rev = "d118983bf922ac96c68b885dc55da30435adbc7d" }
+craft-sourcemap = { git = "https://github.com/storytold/craft-libs", rev = "d118983bf922ac96c68b885dc55da30435adbc7d" }
+craft-wasm = { git = "https://github.com/storytold/craft-libs", rev = "d118983bf922ac96c68b885dc55da30435adbc7d" }
+craft-plist = { git = "https://github.com/storytold/craft-libs", rev = "d118983bf922ac96c68b885dc55da30435adbc7d" }
+craft-sniff = { git = "https://github.com/storytold/craft-libs", rev = "d118983bf922ac96c68b885dc55da30435adbc7d" }
+craft-dex = { git = "https://github.com/storytold/craft-libs", rev = "35afed3956e14fb813f8c27bc82d65c2bce00028" }
+craft-pkcs7 = { git = "https://github.com/storytold/craft-libs", rev = "1acd07f6bc48b04df49aa00e1c3852b159151d63" }
+craft-sqlite = { git = "https://github.com/storytold/craft-libs", rev = "0350c2edc0d6455c63ead4d48c83b9d262d0cb93" }
+craft-jsonrpc = { git = "https://github.com/storytold/craft-libs", rev = "512a1b8e8b59a7b325e7f69f6131aa8628470288" }
+craft-mcp-server = { git = "https://github.com/storytold/craft-libs", rev = "512a1b8e8b59a7b325e7f69f6131aa8628470288" }
+craft-dds = { git = "https://github.com/storytold/craft-libs", rev = "429937ad72e16fa2bb5a9f085dee80809e4a566d" }
 thiserror = "2"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
@@ -75,11 +98,17 @@ unsafe_code = "forbid"
 dbg_macro = "warn"
 todo = "warn"
 
+# Full debug information made about 90% of every development executable and filled disks (#1584).
+# Our own code keeps file and line for backtraces; dependencies carry none. To step through
+# variables in a debugger, build with CARGO_PROFILE_DEV_DEBUG=2 (our crates only); for
+# dependencies too, add --config 'profile.dev.package."*".debug=2'.
 [profile.dev.package."*"]
 opt-level = 2
+debug = false
 
 [profile.dev]
 opt-level = 1
+debug = "line-tables-only"
 
 [profile.release]
 lto = "thin"

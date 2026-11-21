@@ -5,7 +5,7 @@
 use crate::feed;
 use crate::inbox::{Answer, Inbox};
 use crate::tool::{Ctx, Effects, Requires, ToolOutput, ToolSpec, Toolset, parse_params, schema_of};
-use crate::workspace::{ACTION_KINDS, ActionKind, Approval, Workspace};
+use crate::workspace::{ACTION_KINDS, ActionKind, Approval, USAGE_FILE, Workspace};
 use craft_anything_evidence::{ErrorCode, ToolError};
 use craft_anything_platform::sync::Mutex;
 use schemars::JsonSchema;
@@ -537,7 +537,10 @@ fn open(project: &std::path::Path) -> Result<Workspace, ToolError> {
 
 fn summary(ws: &Workspace) -> Value {
     let m = &ws.manifest;
-    json!({
+    // An unreadable usage.json is never shown as zeros: `usage` is null and `usage_unreadable` says why.
+    let usage = ws.usage();
+    let usage_unreadable = usage.is_unreadable();
+    let mut out = json!({
         "name": m.name,
         "folder": ws.root.display().to_string(),
         "app_folder": ws.app_dir().display().to_string(),
@@ -550,8 +553,13 @@ fn summary(ws: &Workspace) -> Value {
         "updated_ms": m.updated_ms,
         "last_check": m.checks.last(),
         "waiting": Inbox::new(ws.inbox_dir()).pending().len(),
-        "usage": ws.usage(),
-    })
+        "usage": usage.known(),
+        "usage_unreadable": usage_unreadable,
+    });
+    if usage_unreadable && let Some(o) = out.as_object_mut() {
+        o.insert("usage_note".into(), json!(format!("The project's {USAGE_FILE} couldn't be read, so what its builds used and spent isn't known.")));
+    }
+    out
 }
 
 fn project_list(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
@@ -727,6 +735,31 @@ mod tests {
         let again = call("project_inbox_answer", json!({"project": ws.root, "id": q, "choice": "Red"}));
         assert!(again.is_err(), "a question is answered once");
         assert!(call("project_show", json!({"project": d.path().join("nope")})).is_err());
+    }
+
+    /// An unreadable usage.json is said to be unknown, never shown as zeros.
+    #[test]
+    fn a_projects_unreadable_usage_is_unknown_not_zero() {
+        let d = tempfile::tempdir().unwrap();
+        let ws = Workspace::create(d.path(), "Snake", "A snake game", TargetRef::None).unwrap();
+        let e = Engine::new(crate::testing::session());
+        let show = || e.call("project_show", json!({"project": ws.root}), CallOptions::new(Caller::Cli)).unwrap().to_json()["result"].clone();
+
+        let none = show();
+        assert_eq!((none["usage_unreadable"].clone(), none["usage"]["cost_usd"].clone()), (json!(false), json!(0.0)), "{none}");
+        assert!(none.get("usage_note").is_none());
+
+        std::fs::write(ws.root.join(USAGE_FILE), b"{ not json").unwrap();
+        let bad = show();
+        assert_eq!(bad["usage_unreadable"], true, "{bad}");
+        assert!(bad["usage"].is_null(), "no zeros stand in for it: {bad}");
+        assert!(bad["usage_note"].as_str().unwrap().contains("isn't known"));
+        let list = e.call("project_list", json!({"projects_dir": d.path()}), CallOptions::new(Caller::Cli)).unwrap().to_json();
+        assert_eq!(list["result"]["projects"][0]["usage_unreadable"], true);
+
+        std::fs::write(ws.root.join(USAGE_FILE), br#"{"version":1,"cost_usd":2.5,"priced":true}"#).unwrap();
+        let known = show();
+        assert_eq!((known["usage_unreadable"].clone(), known["usage"]["cost_usd"].clone()), (json!(false), json!(2.5)), "{known}");
     }
 
     #[test]

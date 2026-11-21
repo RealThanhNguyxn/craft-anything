@@ -17,16 +17,26 @@ pub struct ProjectClock {
     pub saved: ProjectUsage,
     /// A run is working: since when its time isn't in `saved` yet.
     pub since: Option<Instant>,
+    /// usage.json is there but couldn't be read: `saved` is empty and what was used isn't known.
+    pub unreadable: bool,
 }
 
 impl ProjectClock {
     pub fn load(root: &Path) -> ProjectClock {
-        ProjectClock { saved: ProjectUsage::load(root), since: None }
+        let mut clock = ProjectClock::default();
+        clock.read(root);
+        clock
+    }
+
+    fn read(&mut self, root: &Path) {
+        let read = ProjectUsage::read(root);
+        self.unreadable = read.is_unreadable();
+        self.saved = read.known().unwrap_or_default();
     }
 
     /// The run saved its usage (an agent turn ended, or the run did): read it again.
     pub fn saved_again(&mut self, root: &Path, still_working: bool) {
-        self.saved = ProjectUsage::load(root);
+        self.read(root);
         self.since = still_working.then(Instant::now);
     }
 
@@ -37,6 +47,40 @@ impl ProjectClock {
     /// Building time so far, the run going now included.
     pub fn elapsed(&self) -> Duration {
         Duration::from_millis(self.saved.work_ms) + self.since.map_or(Duration::ZERO, |s| s.elapsed())
+    }
+
+    /// Whether there's anything to show: time, use, or a record that couldn't be read.
+    pub fn shown(&self) -> bool {
+        self.unreadable || self.working() || !self.elapsed().is_zero()
+    }
+
+    /// "12m 05s", or "Unknown" when the record couldn't be read.
+    pub fn time_words(&self) -> String {
+        if self.unreadable { tr("Unknown") } else { duration_words(self.elapsed()) }
+    }
+
+    /// The cost row, if there's one to show. An unreadable record is an unknown cost, never $0.
+    pub fn cost(&self) -> Option<CostStat> {
+        if self.unreadable {
+            return Some(CostStat { label: "AI cost", value: tr("Unknown"), note: None });
+        }
+        self.saved.priced.then(|| cost_stat(&self.saved))
+    }
+
+    /// The token count, if there's one to show. An unreadable record is an unknown count, never 0.
+    pub fn tokens(&self) -> Option<String> {
+        if self.unreadable {
+            return Some(tr("Unknown"));
+        }
+        (self.saved.tokens() > 0 || self.saved.tokens_incomplete).then(|| token_total(&self.saved, false))
+    }
+
+    /// The tooltip for these rows (`counts` as in [`explain`]).
+    pub fn explain(&self, counts: &str) -> String {
+        if self.unreadable {
+            return tr("This project's usage record couldn't be read, so what its builds spent isn't known.");
+        }
+        explain(&self.saved, counts)
     }
 }
 
@@ -156,6 +200,33 @@ mod tests {
         assert_eq!(c.elapsed(), Duration::from_secs(725));
     }
 
+    /// An unreadable usage.json shows as unknown, never as $0 or 0 tokens.
+    #[test]
+    fn an_unreadable_usage_record_is_unknown_not_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = ProjectClock::load(dir.path());
+        assert!(!c.unreadable && !c.shown() && c.cost().is_none() && c.tokens().is_none(), "no file: nothing to show");
+
+        std::fs::write(dir.path().join(craft_anything_engine::workspace::USAGE_FILE), b"{ not json").unwrap();
+        let mut c = ProjectClock::load(dir.path());
+        assert!(c.unreadable && c.shown());
+        let cost = c.cost().unwrap();
+        assert_eq!((cost.label, cost.value.as_str()), ("AI cost", "Unknown"));
+        assert_eq!(c.tokens().as_deref(), Some("Unknown"));
+        assert_eq!(c.time_words(), "Unknown");
+        assert!(c.explain("x").contains("couldn't be read"));
+        for shown in [cost.value, c.tokens().unwrap(), c.time_words(), c.explain("x")] {
+            assert!(!shown.contains('$') && !shown.contains('0'), "no amount stands in for it: {shown}");
+        }
+
+        // Fixed: read again, it's known.
+        ProjectUsage::update(dir.path(), |_| {}).unwrap_err();
+        std::fs::write(dir.path().join(craft_anything_engine::workspace::USAGE_FILE), br#"{"version":1,"cost_usd":1.5,"priced":true}"#).unwrap();
+        c.saved_again(dir.path(), false);
+        assert!(!c.unreadable);
+        assert_eq!(c.cost().unwrap().value, "about $1.50");
+    }
+
     #[test]
     fn a_coding_agents_cost_is_called_an_estimate_and_a_keys_is_not() {
         let mut agent = ProjectUsage::default();
@@ -187,14 +258,14 @@ mod tests {
             r#"{"version":1,"work_ms":5,"input_tokens":1,"output_tokens":1,"cost_usd":3.12,"priced":true}"#,
         )
         .unwrap();
-        assert_eq!(cost_stat(&ProjectUsage::load(dir.path())).label, "AI cost (estimate)");
+        assert_eq!(cost_stat(&ProjectUsage::read(dir.path()).known().unwrap()).label, "AI cost (estimate)");
     }
 
     #[test]
     fn an_unreported_turn_is_visible_and_reported_counts_are_lower_bounds() {
         let dir = tempfile::tempdir().unwrap();
         ProjectUsage::update(dir.path(), |u| u.tokens_incomplete = true).unwrap();
-        let mut usage = ProjectUsage::load(dir.path());
+        let mut usage = ProjectUsage::read(dir.path()).known().unwrap();
         assert!(usage.used_anything());
         assert_eq!(token_total(&usage, true), "Unknown");
         assert!(explain(&usage, "x").starts_with("Unknown in, Unknown out."));

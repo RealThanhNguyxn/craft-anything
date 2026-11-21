@@ -128,6 +128,11 @@ fn db_sqlite_show(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolEr
             Some(obj) => {
                 return Err(ToolError::invalid(format!("\"{}\" is a {}, not a table; rows can only be read from tables", obj.name, obj.obj_type)));
             }
+            None if overview.schema_truncated => {
+                return Err(ToolError::invalid(format!("no table named {name:?} in the listed part of the schema")).with_remediation(
+                    "The schema isn't complete (see integrity_notes from a call without `table`); the table may be in the part that was skipped.",
+                ));
+            }
             None => {
                 return Err(ToolError::invalid(format!("no table named {name:?} in this database"))
                     .with_remediation("Call the tool without `table` to list the schema, then pass an exact name."));
@@ -186,11 +191,24 @@ fn db_sqlite_show(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolEr
         "blobs_not_dumped",
         "BLOB values are reported as a byte length and a SHA-256 prefix, never dumped; overflow payloads are bounded.",
     ));
+    if overview.schema_truncated {
+        lims.push(Limitation::new(
+            "schema_incomplete",
+            "The schema listing is incomplete: part of sqlite_schema couldn't be read, or it holds more objects than are listed; see integrity_notes.",
+        ));
+    }
     if !row_notes.is_empty() {
         lims.push(Limitation::new("read_notes", "Some rows or values were skipped or truncated while reading; see rows.notes."));
     }
 
-    let coverage = row_coverage.unwrap_or_else(|| Coverage::complete(tables.len() as u64));
+    let coverage = row_coverage.unwrap_or_else(|| {
+        let listed = tables.len() as u64;
+        if overview.schema_truncated {
+            Coverage { status: CoverageStatus::Partial, examined: Some(listed), total: None, next_offset: None }
+        } else {
+            Coverage::complete(listed)
+        }
+    });
 
     let ev = builder(ctx, "db_sqlite_show", input.subject.clone(), json!({"path": input.path, "table": p.table, "offset": p.offset, "limit": limit}))
         .result(json!({
@@ -375,6 +393,28 @@ mod tests {
         let bad = temp_file("notdb.bin", b"this is not a database at all");
         let err = call_err(&e, "db_sqlite_show", json!({"path": bad}));
         assert!(err.message.to_lowercase().contains("sqlite"));
+    }
+
+    #[test]
+    fn incomplete_schema_is_disclosed() {
+        let e = Engine::new(crate::testing::session());
+        let intact = call(&e, "db_sqlite_show", json!({"path": temp_file("app.db", &fx::simple_db())}));
+        assert_eq!(intact["coverage"]["status"], "complete");
+        assert!(!intact["limitations"].as_array().unwrap().iter().any(|l| l["code"] == "schema_incomplete"));
+
+        // A second schema row whose cell pointer leaves page 1.
+        let mut bytes = fx::simple_db();
+        bytes[103..105].copy_from_slice(&2u16.to_be_bytes());
+        bytes[110..112].copy_from_slice(&u16::MAX.to_be_bytes());
+        let p = temp_file("damaged.db", &bytes);
+        let v = call(&e, "db_sqlite_show", json!({"path": p}));
+        assert_eq!(v["result"]["tables"][0]["name"], "items");
+        assert_eq!(v["result"]["schema_truncated"], true);
+        assert_eq!(v["coverage"]["status"], "partial");
+        assert!(v["limitations"].as_array().unwrap().iter().any(|l| l["code"] == "schema_incomplete"));
+        assert!(v["result"]["integrity_notes"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().contains("sqlite_schema")));
+        assert!(call_err(&e, "db_sqlite_show", json!({"path": p, "table": "nope"})).message.contains("listed part of the schema"));
+        assert_eq!(call(&e, "db_sqlite_show", json!({"path": p, "table": "items"}))["result"]["rows"]["total_rows"], 3);
     }
 
     #[test]

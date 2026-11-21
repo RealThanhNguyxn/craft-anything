@@ -6,9 +6,13 @@ use crate::i18n::{tr, trf};
 use crate::state::Modal;
 use crate::theme::{self, Tokens};
 use crate::{CraftApp, icons, widgets};
-use craft_anything_ai::rebuild::replaced_builder_notice;
 use craft_anything_ai::{BackendConfig, BackendKind};
 use egui::{RichText, Ui, Vec2};
+
+/// Localise only the UI notice; headless callers keep the AI layer's English response.
+pub(crate) fn replaced_builder_notice(saved: &str, used: &str) -> String {
+    trf("The AI chosen for this project ({saved}) is turned off or no longer set up. {used} builds instead.", &[("saved", saved), ("used", used)])
+}
 
 /// A live agent catalogue and a draft selection, tied to the settings that were queried.
 pub struct AgentModelPicker {
@@ -302,6 +306,15 @@ impl CraftApp {
         })
     }
 
+    /// The tools future builders on an API backend are offered. Returns the job, so Settings can wait for it.
+    pub fn set_tool_list(&mut self, name: &str, list: craft_anything_ai::ToolList) -> u64 {
+        let (hub, name) = (self.hub.clone(), name.to_string());
+        self.jobs.spawn(tr("Change a builder's tools"), false, move |_| {
+            hub.set_tool_list(&name, list).map_err(|e| e.message)?;
+            Ok(crate::backends(&hub))
+        })
+    }
+
     /// Connect the server in Settings → AI's address form. Its key goes to the keychain; the form
     /// keeps what was typed until it's added, so a mistake can be fixed.
     pub fn add_server(&mut self) {
@@ -312,7 +325,8 @@ impl CraftApp {
         let shown = name.clone();
         let job = self.jobs.spawn(trf("Connect {name}", &[("name", &name)]), true, move |j| {
             let result = hub.add_server_until(&name, &address, Some(model.as_str()).filter(|m| !m.is_empty()), key, &j.cancel).map(|_| ());
-            Ok(crate::Done::BackendAdded { name, result, choices })
+            let address = address.trim().to_string();
+            Ok(crate::Done::BackendAdded { name, result, choices, address })
         });
         self.server_form.connecting = Some((job, shown, std::time::Instant::now()));
     }

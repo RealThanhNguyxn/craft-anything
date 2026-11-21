@@ -167,7 +167,7 @@ craft-anything-cli rebuild https://example.com "Recreate this website"
 **Rust 1.97 이상**이 필요합니다(하위 의존성에 필요하며, `rustup update`로 업데이트합니다). Debian 또는 Ubuntu에서는 데스크톱 앱에 다음 패키지도 필요합니다:
 
 ```sh
-sudo apt-get install libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev libgtk-3-dev
+sudo apt-get install build-essential libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev libgtk-3-dev
 ```
 
 그다음:

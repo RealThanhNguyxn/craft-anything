@@ -172,7 +172,7 @@ craft-anything-cli rebuild https://example.com "Recreate this website"
 需要 Rust **1.97 或更新**（有依赖要求它；`rustup update`）。在 Debian 或 Ubuntu 上，桌面应用还需要：
 
 ```sh
-sudo apt-get install libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev libgtk-3-dev
+sudo apt-get install build-essential libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev libgtk-3-dev
 ```
 
 然后：

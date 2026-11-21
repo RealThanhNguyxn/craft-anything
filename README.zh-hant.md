@@ -193,7 +193,7 @@ craft-anything-cli rebuild https://example.com "Recreate this website"
 桌面應用程式還需要：
 
 ```sh
-sudo apt-get install libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev libgtk-3-dev
+sudo apt-get install build-essential libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev libgtk-3-dev
 ```
 
 接著：

@@ -127,16 +127,22 @@ pub fn claim(dir: &Path) -> Vec<String> {
         .collect()
 }
 
-/// What the hook prints for the agent: the notes as context for its next step, or nothing.
-pub fn hook_output(texts: &[String]) -> Option<String> {
+/// The notes as context for the builder's next step, or nothing: what a coding agent's hook
+/// prints, and what the API-backend loop adds after a step's tool results.
+pub fn context(texts: &[String]) -> Option<String> {
     if texts.is_empty() {
         return None;
     }
     let list = texts.iter().map(|t| format!("- {t}")).collect::<Vec<_>>().join("\n");
     // Stated as facts: the agent reads it as context, not as an order from the tool.
-    let context = format!(
+    Some(format!(
         "The person added this while you were working:\n{list}\nIt applies to the work from here on, and your reply can say how you took it into account."
-    );
+    ))
+}
+
+/// What the hook prints for the agent: the notes as context for its next step, or nothing.
+pub fn hook_output(texts: &[String]) -> Option<String> {
+    let context = context(texts)?;
     Some(serde_json::json!({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": context}}).to_string())
 }
 

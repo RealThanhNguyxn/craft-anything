@@ -48,6 +48,7 @@ impl<'ast> Visit<'ast> for Lookups {
                 ("widgets", "choice_tile" | "big_card") => &[3, 4],
                 ("widgets", "empty_state") => &[2, 3],
                 ("icons", "button") => &[4],
+                ("Button", "new") => &[1],
                 _ => &[],
             };
             for &i in positions {
@@ -179,6 +180,7 @@ mod tests {
             fn screen() {
                 tr(if mode == "internal" { "Simple" } else { "Advanced" });
                 widgets::primary_icon(ui, Some("play"), "Start", true);
+                ui.add(widgets::Button::new(widgets::ButtonKind::Secondary, "Sign in").enabled(free));
                 icons::button(ui, "x", 20.0, false, "Close");
                 widgets::segmented(ui, &["One", "Two"], 0, 30.0);
                 widgets::named(resp, &trf("Open {name}", &[("name", "sample.exe")]));
@@ -189,7 +191,7 @@ mod tests {
         .unwrap();
         let mut lookups = Lookups::default();
         lookups.visit_file(&file);
-        assert_eq!(lookups.0.0, ["Advanced", "Close", "One", "Open {name}", "Simple", "Start", "Two"].into_iter().map(str::to_string).collect());
+        assert_eq!(lookups.0.0, ["Advanced", "Close", "One", "Open {name}", "Sign in", "Simple", "Start", "Two"].into_iter().map(str::to_string).collect());
     }
 
     fn set(keys: &[&str]) -> BTreeSet<String> {

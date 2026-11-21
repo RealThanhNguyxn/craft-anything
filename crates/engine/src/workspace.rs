@@ -21,6 +21,7 @@ use crate::inbox::{next_counter, now_ms};
 use crate::project::write_atomic;
 use crate::versioned::{self, upgrade};
 use craft_anything_evidence::{ErrorCode, ToolError};
+use craft_anything_platform::fs::read_file_capped;
 use craft_anything_platform::sync::Mutex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -600,17 +601,53 @@ pub const USAGE_VERSION: u32 = 1;
 /// A build's turn and a question can record their cost at the same time. The save is
 /// read-modify-write, so both go through one lock or one would overwrite the other.
 static USAGE_UPDATE: Mutex<()> = Mutex::new(());
+/// A real usage.json is a few hundred bytes; anything this big isn't one.
+const MAX_USAGE_BYTES: u64 = 1024 * 1024;
 
-impl ProjectUsage {
-    /// The saved usage of the project at `root`; nothing yet (or unreadable) is all zeros.
-    pub fn load(root: &Path) -> ProjectUsage {
-        std::fs::read(root.join(USAGE_FILE)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+/// What reading a project's usage.json found.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UsageRead {
+    /// There is no file: nothing has been used yet.
+    None,
+    Known(ProjectUsage),
+    /// The file is there but couldn't be read or understood, so what was used isn't known.
+    /// It is never shown as zero.
+    Unreadable,
+}
+
+impl UsageRead {
+    /// The usage as far as it's known: `None` when the file couldn't be read.
+    pub fn known(self) -> Option<ProjectUsage> {
+        match self {
+            UsageRead::None => Some(ProjectUsage::default()),
+            UsageRead::Known(u) => Some(u),
+            UsageRead::Unreadable => None,
+        }
     }
 
-    /// Change the saved usage (the run's job). A file from a newer Craft Anything is left alone.
+    pub fn is_unreadable(&self) -> bool {
+        matches!(self, UsageRead::Unreadable)
+    }
+}
+
+impl ProjectUsage {
+    /// Read the saved usage of the project at `root`. Only a missing file means nothing was used;
+    /// any other failure, or a file that doesn't parse, is [`UsageRead::Unreadable`].
+    pub fn read(root: &Path) -> UsageRead {
+        match read_file_capped(&root.join(USAGE_FILE), MAX_USAGE_BYTES) {
+            Err(e) if e.code == ErrorCode::NotFound => UsageRead::None,
+            Err(_) => UsageRead::Unreadable,
+            Ok(bytes) => serde_json::from_slice(&bytes).map_or(UsageRead::Unreadable, UsageRead::Known),
+        }
+    }
+
+    /// Change the saved usage (the run's job). A file from a newer Craft Anything, or one that
+    /// can't be read, is left alone: writing over it would lose what it counted.
     pub fn update(root: &Path, f: impl FnOnce(&mut ProjectUsage)) -> Result<(), ToolError> {
         let _updating = USAGE_UPDATE.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut u = ProjectUsage::load(root);
+        let Some(mut u) = ProjectUsage::read(root).known() else {
+            return Err(ToolError::invalid(format!("{USAGE_FILE} couldn't be read, so it isn't changed.")));
+        };
         if u.version > USAGE_VERSION {
             return Err(ToolError::unsupported(format!("{USAGE_FILE} was written by a newer Craft Anything, so it isn't changed.")));
         }
@@ -658,6 +695,22 @@ pub struct Workspace {
 /// already-absolute path is kept; one that can't be made absolute is returned unchanged.
 pub fn absolute(path: &Path) -> PathBuf {
     std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// `path` with `.` and `..` resolved lexically (no symlinks), made absolute when relative.
+pub fn normalized(path: &Path) -> PathBuf {
+    let path = absolute(path);
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// A folder-name slug: lower-case words joined by dashes, at most 40 characters.
@@ -929,9 +982,9 @@ impl Workspace {
         std::fs::read(self.root.join(ASSETS)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
     }
 
-    /// What the builds have taken and used so far.
-    pub fn usage(&self) -> ProjectUsage {
-        ProjectUsage::load(&self.root)
+    /// What the builds have taken and used so far, or that it can't be known.
+    pub fn usage(&self) -> UsageRead {
+        ProjectUsage::read(&self.root)
     }
 
     /// What generated assets have cost so far.
@@ -1517,7 +1570,7 @@ mod tests {
     #[test]
     fn a_projects_usage_adds_up_across_runs_and_a_newer_file_is_left_alone() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(ProjectUsage::load(dir.path()), ProjectUsage::default(), "nothing yet");
+        assert_eq!(ProjectUsage::read(dir.path()), UsageRead::None, "nothing yet");
         for cost in [Some(1.25), None, Some(f64::NAN), Some(2.0)] {
             ProjectUsage::update(dir.path(), |u| {
                 u.work_ms += 1_000;
@@ -1525,11 +1578,60 @@ mod tests {
             })
             .unwrap();
         }
-        let u = ProjectUsage::load(dir.path());
+        let u = ProjectUsage::read(dir.path()).known().unwrap();
         assert_eq!((u.version, u.work_ms, u.tokens(), u.cost_usd, u.priced), (USAGE_VERSION, 4_000, 440, 3.25, true));
         std::fs::write(dir.path().join(USAGE_FILE), r#"{"version": 99, "work_ms": 5}"#).unwrap();
         assert!(ProjectUsage::update(dir.path(), |u| u.work_ms = 0).is_err());
-        assert_eq!(ProjectUsage::load(dir.path()).work_ms, 5, "read as far as it's known, never written over");
+        assert_eq!(ProjectUsage::read(dir.path()).known().unwrap().work_ms, 5, "read as far as it's known, never written over");
+    }
+
+    /// An unreadable usage.json is unknown, never zeros, and a run doesn't write over it.
+    #[test]
+    fn an_unreadable_usage_file_is_unknown_and_left_alone() {
+        let unreadable = |root: &Path, why: &str| {
+            assert_eq!(ProjectUsage::read(root), UsageRead::Unreadable, "{why}");
+            assert!(ProjectUsage::read(root).known().is_none(), "{why}");
+            assert!(ProjectUsage::update(root, |u| u.add_turn(1, 1, Some(1.0), false)).is_err(), "{why}");
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(USAGE_FILE);
+        for bytes in [&b"{ not json"[..], b"", b"null", b"\xff\xfe"] {
+            std::fs::write(&file, bytes).unwrap();
+            unreadable(dir.path(), &format!("{bytes:?}"));
+            assert_eq!(std::fs::read(&file).unwrap(), bytes, "the bytes are left as they were");
+        }
+
+        // A folder where the file should be.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(USAGE_FILE)).unwrap();
+        unreadable(dir.path(), "a folder");
+        assert!(dir.path().join(USAGE_FILE).is_dir());
+
+        // Too big to be a real one.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::File::create(dir.path().join(USAGE_FILE)).unwrap().set_len(MAX_USAGE_BYTES + 1).unwrap();
+        unreadable(dir.path(), "too big");
+
+        // A file it may not read.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join(USAGE_FILE);
+            std::fs::write(&file, br#"{"version":1,"cost_usd":2.0}"#).unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+            // Root reads it anyway; the case only means something where the permission holds.
+            if std::fs::read(&file).is_err() {
+                unreadable(dir.path(), "no read permission");
+            }
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        // A readable one is known, with the fields it has.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(USAGE_FILE), br#"{"version":1,"cost_usd":2.0,"priced":true}"#).unwrap();
+        let UsageRead::Known(u) = ProjectUsage::read(dir.path()) else { panic!("a readable file is known") };
+        assert_eq!((u.cost_usd, u.priced), (2.0, true));
     }
 
     /// A build turn and a question can save their cost together: neither may overwrite the other.
@@ -1549,7 +1651,7 @@ mod tests {
                 });
             }
         });
-        let u = ProjectUsage::load(root);
+        let u = ProjectUsage::read(root).known().unwrap();
         assert!((u.cost_usd - 2.0).abs() < 1e-6, "{u:?}");
         assert!(u.priced);
     }
@@ -2055,5 +2157,11 @@ mod tests {
         ws.delete().unwrap();
         assert_eq!(std::fs::read_to_string(mine.join("index.html")).unwrap(), "<p>hi</p>");
         assert!(!mine.join(MANIFEST).exists() && !mine.join("inbox").exists() && !mine.join(AGENT_SESSION_FILE).exists());
+    }
+
+    #[test]
+    fn normalized_resolves_dot_and_parent_components() {
+        let root = std::env::current_dir().unwrap();
+        assert_eq!(normalized(&root.join("a/../b/./c")), root.join("b/c"));
     }
 }

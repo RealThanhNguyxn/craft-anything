@@ -109,7 +109,10 @@ impl CraftApp {
                     slot.answer = Some(Ok(answer));
                     slot.reveal = true;
                 }
-                if let Some(notice) = a["builder_notice"].as_str() {
+                if let (Some(saved), Some(used)) = (a["builder_replacement"]["saved"].as_str(), a["builder_replacement"]["used"].as_str()) {
+                    self.toast(crate::builders::replaced_builder_notice(saved, used), false);
+                } else if let Some(notice) = a["builder_notice"].as_str() {
+                    // Compatibility with responses that predate the structured names.
                     self.toast(notice.to_string(), false);
                 }
                 if let Some(why) = v["not_kept"].as_str() {

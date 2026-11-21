@@ -115,7 +115,7 @@ pub fn install(
         }
     };
 
-    let dest = store_dir.join(engine_id);
+    let dest = store_dir.join(engine.store_folder());
     let _ = std::fs::remove_dir_all(&dest);
     if let Err(e) = std::fs::rename(&incoming, &dest) {
         let _ = std::fs::remove_dir_all(&incoming);

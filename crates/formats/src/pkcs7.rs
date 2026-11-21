@@ -3,10 +3,11 @@
 //! attribute (the hash of the signed content — for code signing, the primary CodeDirectory), and
 //! the signature. Parsing is bounded and never panics; verification is done in [`crate::verify`].
 
-use crate::der::{self, Tlv};
+use crate::der;
 use crate::verify::{Digest, PssParameters, SigScheme};
+use craft_pkcs7::inspection::Element;
+use craft_pkcs7::inspection::cms::{SignedDataView, SignerInfoView};
 
-const SIGNED_DATA: &str = "1.2.840.113549.1.7.2";
 const OID_MESSAGE_DIGEST: &str = "1.2.840.113549.1.9.4";
 const OID_CONTENT_TYPE: &str = "1.2.840.113549.1.9.3";
 const RSA_ENCRYPTION: &str = "1.2.840.113549.1.1.1";
@@ -48,8 +49,20 @@ pub struct SignedData {
     pub econtent: Option<Vec<u8>>,
 }
 
-fn oid_of(data: &[u8], t: &Tlv) -> String {
-    der::oid(t.bytes(data).unwrap_or(&[]))
+fn oid_of(element: &Element<'_>) -> String {
+    der::oid(element.value())
+}
+
+fn alg_oid(seq: &Element<'_>) -> Option<String> {
+    if seq.tag() != 0x30 {
+        return None;
+    }
+    let first = seq.children().ok()?.next_element().ok()??;
+    if first.tag() != 0x06 {
+        return None;
+    }
+    let id = oid_of(&first);
+    (id != "invalid").then_some(id)
 }
 
 pub(crate) fn digest_from_oid(oid: &str) -> Option<Digest> {
@@ -66,47 +79,54 @@ fn hexs(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-fn complete_children(data: &[u8], parent: &Tlv) -> Option<Vec<Tlv>> {
-    let fields = der::children(data, parent);
-    (fields.last().map_or(parent.content, Tlv::end) == parent.end()).then_some(fields)
+fn complete_children<'a>(parent: &Element<'a>) -> Option<Vec<Element<'a>>> {
+    let mut cursor = parent.children().ok()?;
+    let mut out = Vec::new();
+    loop {
+        match cursor.next_element() {
+            Ok(Some(element)) => out.push(element),
+            Ok(None) => return Some(out),
+            Err(_) => return None,
+        }
+    }
 }
 
 /// Validate required authenticated attributes while retaining a concrete reason for rejection.
-fn signed_attributes(data: &[u8], attrs: &Tlv, encapsulated_type: &str) -> Result<(String, String), &'static str> {
+fn signed_attributes(attrs: &Element<'_>, encapsulated_type: &str) -> Result<(String, String), &'static str> {
     let mut message_digest = None;
     let mut content_type = None;
-    for attribute in complete_children(data, attrs).ok_or("CMS signed attributes: the attribute list is incomplete.")? {
-        if attribute.tag != 0x30 {
+    for attribute in complete_children(attrs).ok_or("CMS signed attributes: the attribute list is incomplete.")? {
+        if attribute.tag() != 0x30 {
             return Err("CMS signed attributes: an attribute is not a SEQUENCE.");
         }
-        let fields = complete_children(data, &attribute).ok_or("CMS signed attributes: an attribute is incomplete.")?;
+        let fields = complete_children(&attribute).ok_or("CMS signed attributes: an attribute is incomplete.")?;
         let [oid, values] = fields.as_slice() else { return Err("CMS signed attributes: an attribute must contain an OID and one value set.") };
-        if oid.tag != 0x06 || values.tag != 0x31 {
+        if oid.tag() != 0x06 || values.tag() != 0x31 {
             return Err("CMS signed attributes: an attribute must contain an OID and one value set.");
         }
-        let name = oid_of(data, oid);
+        let name = oid_of(oid);
         if name == "invalid" {
             return Err("CMS signed attributes: an attribute OID is malformed.");
         }
-        let values = complete_children(data, values).ok_or("CMS signed attributes: an attribute value set is incomplete.")?;
+        let values = complete_children(values).ok_or("CMS signed attributes: an attribute value set is incomplete.")?;
         if name == OID_MESSAGE_DIGEST || name == OID_CONTENT_TYPE {
             let [value] = values.as_slice() else { return Err("CMS signed attributes: messageDigest and contentType must each have one value.") };
             if name == OID_MESSAGE_DIGEST {
                 if message_digest.is_some() {
                     return Err("CMS signed attributes: messageDigest occurs more than once.");
                 }
-                if value.tag != 0x04 {
+                if value.tag() != 0x04 {
                     return Err("CMS signed attributes: messageDigest is not an OCTET STRING.");
                 }
-                message_digest = Some(hexs(value.bytes(data).ok_or("CMS signed attributes: messageDigest bytes are incomplete.")?));
+                message_digest = Some(hexs(value.value()));
             } else {
                 if content_type.is_some() {
                     return Err("CMS signed attributes: contentType occurs more than once.");
                 }
-                if value.tag != 0x06 {
+                if value.tag() != 0x06 {
                     return Err("CMS signed attributes: contentType is not an OID.");
                 }
-                if oid_of(data, value) != encapsulated_type {
+                if oid_of(value) != encapsulated_type {
                     return Err("CMS signed attributes: contentType does not match the encapsulated content type.");
                 }
                 content_type = Some(encapsulated_type.to_string());
@@ -118,51 +138,41 @@ fn signed_attributes(data: &[u8], attrs: &Tlv, encapsulated_type: &str) -> Resul
 
 /// Parse a CMS `SignedData` blob. `None` when it is not well-formed SignedData.
 pub fn parse_signed_data(cms: &[u8]) -> Option<SignedData> {
-    let ci = der::read(cms, 0)?;
-    let kids = der::children(cms, &ci);
-    if !kids.first().is_some_and(|t| t.tag == 0x06 && oid_of(cms, t) == SIGNED_DATA) {
-        return None;
-    }
-    let explicit = kids.get(1).filter(|t| t.tag == 0xa0)?;
-    let sd = der::children(cms, explicit).into_iter().next()?;
-    let fields = der::children(cms, &sd);
-    let encapsulated = fields.get(2).filter(|field| field.tag == 0x30)?;
-    let ec = complete_children(cms, encapsulated)?;
-    let encapsulated_type = oid_of(cms, ec.first().filter(|field| field.tag == 0x06)?);
+    let (view, _) = SignedDataView::parse(cms).ok()?;
+    let ec = complete_children(&view.encapsulated_content)?;
+    let encapsulated_type = oid_of(ec.first().filter(|field| field.tag() == 0x06)?);
     if encapsulated_type == "invalid" {
         return None;
     }
     let econtent = ec
         .get(1)
-        .filter(|field| field.tag == 0xa0)
-        .and_then(|inner| der::children(cms, inner).into_iter().next())
-        .and_then(|value| value.bytes(cms))
-        .map(<[u8]>::to_vec);
+        .filter(|field| field.tag() == 0xa0)
+        .and_then(|inner| inner.children().ok()?.next_element().ok().flatten())
+        .map(|value| value.value().to_vec());
     let mut signer_infos = None;
-    for f in &fields {
-        if f.tag == 0x31 {
-            signer_infos = Some(*f);
+    let mut remaining = view.remaining_fields;
+    while let Ok(Some(field)) = remaining.next_element() {
+        if field.tag() == 0x31 {
+            signer_infos = Some(field);
         }
     }
     let certificates: Vec<Vec<u8>> = der::pkcs7_certificates(cms).into_iter().map(<[u8]>::to_vec).collect();
     let signer_infos = signer_infos?;
-    let signer = der::children(cms, &signer_infos).into_iter().next()?;
-    let si = der::children(cms, &signer);
-    let version = si.first().filter(|field| field.tag == 0x02)?.bytes(cms)?;
+    let signer = signer_infos.children().ok()?.next_element().ok()??;
+    let (si, _) = SignerInfoView::parse(signer.raw()).ok()?;
+    let version = si.version.value();
     let mut signer_identity_notes = Vec::new();
-    let mut idx = 1usize;
-    let sid = si.get(idx)?;
-    let (signer_issuer, signer_serial, signer_key_identifier) = match sid.tag {
+    let (signer_issuer, signer_serial, signer_key_identifier) = match si.identifier.tag() {
         0x30 => {
             if version != [1] {
                 signer_identity_notes.push("SignerInfo version does not match its issuer-and-serial identifier (expected 1).".into());
             }
-            let sid_kids = der::children(cms, sid);
-            if sid_kids.len() != 2 || sid_kids.last().is_none_or(|last| last.end() != sid.end()) {
+            let sid_kids = complete_children(&si.identifier)?;
+            if sid_kids.len() != 2 {
                 return None;
             }
-            let issuer = sid_kids.first().filter(|field| field.tag == 0x30)?.whole(cms)?.to_vec();
-            let serial = sid_kids.get(1).filter(|field| field.tag == 0x02)?.bytes(cms)?;
+            let issuer = sid_kids.first().filter(|field| field.tag() == 0x30)?.raw().to_vec();
+            let serial = sid_kids.get(1).filter(|field| field.tag() == 0x02)?.value();
             if serial.is_empty() {
                 signer_identity_notes.push("The signer serial number is empty; its issuer-and-serial identity cannot be matched.".into());
             }
@@ -172,41 +182,31 @@ pub fn parse_signed_data(cms: &[u8]) -> Option<SignedData> {
             if version != [3] {
                 signer_identity_notes.push("SignerInfo version does not match its subject key identifier (expected 3).".into());
             }
-            (Vec::new(), Vec::new(), Some(sid.bytes(cms)?.to_vec()))
+            (Vec::new(), Vec::new(), Some(si.identifier.value().to_vec()))
         }
         _ => return None,
     };
-    idx += 1;
-    let digest_alg = si.get(idx).filter(|t| t.tag == 0x30)?;
-    let digest = der::seq_alg_oid(cms, digest_alg).and_then(|o| digest_from_oid(&o));
-    idx += 1;
+    let digest = alg_oid(&si.digest_algorithm).and_then(|o| digest_from_oid(&o));
     let mut signed_attrs_error = None;
-    let (signed_attrs_reencoded, message_digest, content_type) = if si.get(idx).is_some_and(|t| t.tag == 0xa0) {
-        let attrs = si.get(idx).copied()?;
-        idx += 1;
-        let (md, ct) = match signed_attributes(cms, &attrs, &encapsulated_type) {
+    let (signed_attrs_reencoded, message_digest, content_type) = if let Some(attrs) = si.signed_attributes {
+        let (md, ct) = match signed_attributes(&attrs, &encapsulated_type) {
             Ok((md, ct)) => (Some(md), Some(ct)),
             Err(reason) => {
                 signed_attrs_error = Some(reason);
                 (None, None)
             }
         };
-        let reenc = attrs.whole(cms).map(|w| {
-            let mut v = w.to_vec();
-            if let Some(first) = v.first_mut() {
-                *first = 0x31;
-            }
-            v
-        });
-        (reenc, md, ct)
+        let mut reenc = attrs.raw().to_vec();
+        if let Some(first) = reenc.first_mut() {
+            *first = 0x31;
+        }
+        (Some(reenc), md, ct)
     } else {
         (None, None, None)
     };
-    let sig_alg = si.get(idx).filter(|t| t.tag == 0x30)?;
-    let signature_algorithm = der::seq_alg_oid(cms, sig_alg).unwrap_or_default();
-    let pss_parameters = if signature_algorithm == RSA_PSS { Some(crate::verify::pss_parameters(sig_alg.whole(cms)?)) } else { None };
-    idx += 1;
-    let signature = si.get(idx).filter(|t| t.tag == 0x04).and_then(|t| t.bytes(cms)).unwrap_or(&[]).to_vec();
+    let signature_algorithm = alg_oid(&si.signature_algorithm).unwrap_or_default();
+    let pss_parameters = if signature_algorithm == RSA_PSS { Some(crate::verify::pss_parameters(si.signature_algorithm.raw())) } else { None };
+    let signature = si.signature.value().to_vec();
     Some(SignedData {
         certificates,
         digest,
@@ -267,6 +267,7 @@ mod tests {
 
     const CONTENT: &[u8] = b"the content bound by the CMS signed attributes";
     const DATA_TYPE: &str = "1.2.840.113549.1.7.1";
+    const SIGNED_DATA: &str = "1.2.840.113549.1.7.2";
 
     fn attribute(oid: &str, values: &[Vec<u8>]) -> Vec<u8> {
         use craft_anything_testkit::android::{der, der_oid};

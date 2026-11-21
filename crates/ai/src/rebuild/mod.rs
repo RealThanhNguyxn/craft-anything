@@ -298,7 +298,7 @@ impl RebuildRun {
                 if !continuing && !ws.capture_dir().exists() {
                     let _ = std::fs::remove_file(ws.transcript_path());
                 }
-                Some(hub.start_builder(&entry, opts.beginner, Some(ws.transcript_path()), run_deep)?)
+                Some(hub.start_builder(&entry, opts.beginner, Some(ws.transcript_path()), run_deep, Some(notes::notes_dir(&ws.inbox_dir())))?)
             }
         };
         // A chosen extractor (an API backend, e.g. Kimi K3) takes a game's files out after a fresh
@@ -1291,7 +1291,7 @@ impl Worker {
                         ws,
                         Step::Build,
                         Status::Building,
-                        "The builder's earlier conversation isn't on this computer. Starting a new one from what the project already has…",
+                        "The builder's earlier conversation isn't on this computer, or has grown too long to continue. Starting a new one from what the project already has…",
                     )?;
                     prompt = f;
                     retry = false;
@@ -1359,8 +1359,12 @@ impl Worker {
                     // Our own loop asks before tools that need consent. The Build tools are the
                     // builder's job (they apply the approval policy themselves); nothing else runs.
                     AgentEvent::ConsentNeeded { call_id, tool, .. } => {
-                        let build = self.engine.registry().get(tool).is_some_and(|s| s.toolset == craft_anything_engine::Toolset::Build);
-                        agent.answer_consent(call_id, build);
+                        if self.engine.registry().get(tool).is_some_and(|s| s.toolset == craft_anything_engine::Toolset::Build) {
+                            agent.answer_consent(call_id, true);
+                        } else {
+                            // Nobody was asked: say so, or the model invents a reason (#1938).
+                            agent.refuse_consent(call_id, &format!("{tool}: {BUILD_REFUSES_CONSENT}."));
+                        }
                     }
                     // Decided on the tool's own id (its CLI and `mcp__…__` names included).
                     AgentEvent::ToolStarted { tool, .. }
@@ -1515,6 +1519,11 @@ fn run_outcome(result: Result<Result<String, ToolError>, Box<dyn std::any::Any +
     }
 }
 
+/// What a builder on an API model is told when it calls a tool that needs consent outside the
+/// Build tools: the build refuses those itself, without asking the person (#1938).
+pub const BUILD_REFUSES_CONSENT: &str = "Nobody was asked: a build doesn't run tools that need the person's consent, so this one didn't run. \
+For a plugin's tool, the plugin's `consent` setting in the person's config.toml decides whether it needs consent";
+
 /// Checks in a row that may find the build not working before the run stops and asks for a new
 /// request. Each "Try again" used to start another `max_rounds` of checks, with nothing counting
 /// across runs, so a build that never came up was checked 40 and 49 times (#736).
@@ -1600,7 +1609,7 @@ pub fn project_builder<'a>(cfg: &crate::AiConfig, ws: &'a Workspace) -> Option<&
 }
 
 /// A project's saved builder that is no longer usable, and the AI that builds in its place.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct BuilderReplacement {
     /// The AI the project saved, which is off or gone.
     pub saved: String,
@@ -1623,7 +1632,7 @@ pub fn builder_replacement(cfg: &crate::AiConfig, ws: &Workspace, explicit: Opti
 }
 
 /// The words for a saved builder that was turned off or removed and the one building instead.
-/// English for now: the wording needs a native speaker's check before it joins the catalogs.
+/// English for headless callers; the UI formats its own catalog entry from the literal names.
 pub fn replaced_builder_notice(saved: &str, used: &str) -> String {
     format!("The AI chosen for this project ({saved}) is turned off or no longer set up. {used} builds instead.")
 }

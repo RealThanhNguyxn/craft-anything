@@ -33,6 +33,22 @@ fn opencode_cli_lists_supported_depths_and_rejects_unsupported_choices() {
     assert_eq!(cli(&["ai", "model", "OpenCode", "test/model", "--default"], cfg.path()).code, Some(2));
 }
 
+/// `ai model <Claude Code> --default` clears an explicit model through the same path as the
+/// positional `default`, with no model-discovery run (Claude Code has no catalogue).
+#[test]
+fn claude_code_default_clears_the_model_without_discovery() {
+    let cfg = tempfile::tempdir().unwrap();
+    for (name, agent) in [("Claude Code", "claude-code"), ("Claude", "claude")] {
+        assert!(cli(&["ai", "add", name, "--kind", "agent_cli", "--model", agent], cfg.path()).success);
+        assert!(cli(&["ai", "model", name, "my-custom-model"], cfg.path()).success);
+        let saved = std::fs::read_to_string(cfg.path().join("config.toml")).unwrap();
+        assert!(saved.contains("my-custom-model"), "{saved}");
+        assert!(cli(&["ai", "model", name, "--default"], cfg.path()).success);
+        let saved = std::fs::read_to_string(cfg.path().join("config.toml")).unwrap();
+        assert!(!saved.contains("cli_model"), "{saved}");
+    }
+}
+
 #[test]
 fn commands_and_exit_codes() {
     let cfg = tempfile::tempdir().unwrap();
@@ -69,6 +85,36 @@ fn ai_request_rate_reads_changes_and_clears_an_api_backends_limit() {
     assert!(run(&["ai", "request-rate", "Local", "0"]).success);
     assert_eq!(read_rate(), Value::Null);
     assert!(!std::fs::read_to_string(config.path().join("config.toml")).unwrap().contains("requests_per_minute"));
+}
+
+/// R5.4: an API backend's tool list is shown beside what Auto works out to there, changed, and
+/// cleared back to Auto; agent apps and unknown lists are refused.
+#[test]
+fn ai_tools_reads_changes_and_clears_an_api_backends_tool_list() {
+    let config = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| cli(args, config.path());
+    assert!(run(&["ai", "add", "Local", "--kind", "openai_compatible", "--model", "test"]).success);
+    assert!(run(&["ai", "add", "Paid", "--kind", "anthropic", "--model", "test"]).success);
+    assert!(run(&["ai", "add", "Claude Code", "--kind", "agent_cli", "--model", "claude-code"]).success);
+    let read = |name: &str| {
+        let output = run(&["ai", "tools", name, "--format", "json"]);
+        assert!(output.success, "{}", String::from_utf8_lossy(&output.stdout));
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let local = read("Local");
+    assert_eq!(local["tools"], "auto");
+    assert!(local["auto"].as_str().unwrap().contains("64k"), "a local model's Auto depends on its window: {local}");
+    assert_eq!(read("Paid")["auto"], "full", "a paid service always gets every tool");
+    assert!(run(&["ai", "tools", "Local", "full"]).success);
+    assert_eq!(read("Local")["tools"], "full");
+    assert!(std::fs::read_to_string(config.path().join("config.toml")).unwrap().contains("tools = \"full\""));
+    assert!(!run(&["ai", "tools", "Local", "some"]).success);
+    assert!(!run(&["ai", "tools", "Claude Code", "lean"]).success);
+    assert!(!run(&["ai", "tools", "Unknown", "lean"]).success);
+    assert_eq!(read("Local")["tools"], "full");
+    assert!(run(&["ai", "tools", "Local", "auto"]).success);
+    assert_eq!(read("Local")["tools"], "auto");
+    assert!(!std::fs::read_to_string(config.path().join("config.toml")).unwrap().contains("tools ="), "Auto is saved as no setting");
 }
 
 /// #1358: the saved key can be reported, replaced and forgotten headlessly, and is never printed.
@@ -399,4 +445,30 @@ fn mcp_restricted_mode_cli() {
     assert_eq!(call_res["isError"], true);
     let err_obj: Value = serde_json::from_str(call_res["content"][0]["text"].as_str().unwrap()).unwrap();
     assert!(err_obj["error"]["message"].as_str().unwrap().contains("turned off in restricted mode"));
+}
+
+/// Uninstall's text output says why a client blocked it and how to fix that, not just the client's name.
+#[test]
+fn uninstall_text_shows_why_a_client_blocks_it_and_the_fix() {
+    let home = tempfile::tempdir().unwrap();
+    let cursor = home.path().join(".cursor");
+    std::fs::create_dir_all(&cursor).unwrap();
+    std::fs::write(cursor.join("mcp.json"), [0xffu8, 0xfe, 0x00]).unwrap();
+    for format in ["text", "md"] {
+        let mut p = Process::new(env!("CARGO_BIN_EXE_craft-anything-cli"))
+            .args(["--format", format, "uninstall"])
+            .env("CRAFT_ANYTHING_CONFIG_DIR", home.path().join("config"))
+            .env("HOME", home.path())
+            .env("USERPROFILE", home.path());
+        // Every client location the host reads from the environment stays inside the temporary home.
+        for k in craft_anything_setup::clients::ENV_KEYS {
+            p = p.env(k, home.path().join(k));
+        }
+        let out = p.timeout(Duration::from_secs(60)).run().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.code, Some(1), "{format}: {text}");
+        assert!(text.contains("blocked by Cursor: Can't read ") && text.contains("the file is not valid UTF-8"), "{format}: {text}");
+        assert!(text.contains("save it as UTF-8 where it is, then run uninstall again."), "{format}: {text}");
+    }
+    assert_eq!(std::fs::read(cursor.join("mcp.json")).unwrap(), [0xffu8, 0xfe, 0x00]);
 }

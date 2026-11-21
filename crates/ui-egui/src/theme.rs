@@ -45,6 +45,25 @@ impl ThemeKind {
     }
 }
 
+/// `settings.theme` for following the system's light or dark appearance, the default.
+pub const SYSTEM: &str = "system";
+
+/// Whether the stored choice follows the system (an empty one, from an older file, does too).
+pub fn follows_system(choice: &str) -> bool {
+    let c = choice.trim();
+    c.is_empty() || c.eq_ignore_ascii_case(SYSTEM)
+}
+
+/// The theme to draw with: a stored Studio or Studio Light as it is, System by the system's
+/// appearance (`ctx.system_theme()`), and dark when the system doesn't say.
+pub fn resolve(choice: &str, system: Option<egui::Theme>) -> ThemeKind {
+    match (follows_system(choice), system) {
+        (true, Some(egui::Theme::Light)) => ThemeKind::StudioLight,
+        (true, _) => ThemeKind::Studio,
+        (false, _) => ThemeKind::from_id(choice),
+    }
+}
+
 /// Colour and shape tokens.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Tokens {
@@ -502,8 +521,8 @@ const SCROLL_THUMB_AT_REST: f32 = 0.5;
 /// two or three turns for what a browser scrolls in one; it still eases to the new place.
 pub const WHEEL_STEP: f32 = 100.0;
 
-/// Apply a theme. `roomy` = Beginner mode (bigger type, more air).
-pub fn apply(ctx: &egui::Context, kind: ThemeKind, roomy: bool) {
+/// Apply a theme: its colours, and the one set of text sizes and spacing both modes use.
+pub fn apply(ctx: &egui::Context, kind: ThemeKind) {
     let t = Tokens::for_kind(kind);
     ctx.data_mut(|d| d.insert_temp(tokens_id(), t));
     ctx.set_theme(if t.dark() { egui::Theme::Dark } else { egui::Theme::Light });
@@ -557,23 +576,25 @@ pub fn apply(ctx: &egui::Context, kind: ThemeKind, roomy: bool) {
         wv.expansion = 0.0;
     }
     ctx.set_visuals(v);
-    // Simple mode is for anyone, including people who find small text hard to read. egui's own
-    // controls (combo boxes, menu rows) are as tall as ours of the mode's size, with its label.
-    let control = if roomy { ControlSize::Medium } else { ControlSize::Small };
+    // One set of sizes for both modes, Simple's, so switching modes changes what is shown, not
+    // how big it is: zoom (Cmd/Ctrl + / −) makes everything bigger. Simple is for anyone,
+    // including people who find small text hard to read. egui's own controls (combo boxes,
+    // menu rows) are as tall as a medium control, with its label.
+    let control = ControlSize::Medium;
     ctx.global_style_mut(|s| {
         s.text_styles = [
-            (TextStyle::Small, FontId::proportional(if roomy { LABEL } else { TINY })),
-            (TextStyle::Body, FontId::proportional(if roomy { BODY } else { LABEL })),
+            (TextStyle::Small, FontId::proportional(LABEL)),
+            (TextStyle::Body, FontId::proportional(BODY)),
             (TextStyle::Button, FontId::proportional(control.text())),
-            (TextStyle::Heading, semibold(if roomy { SECTION } else { CARD })),
-            (TextStyle::Monospace, FontId::monospace(if roomy { LABEL } else { CODE })),
+            (TextStyle::Heading, semibold(SECTION)),
+            (TextStyle::Monospace, FontId::monospace(LABEL)),
         ]
         .into();
-        s.spacing.item_spacing = egui::vec2(space::SM, if roomy { space::SM } else { space::XS });
+        s.spacing.item_spacing = egui::vec2(space::SM, space::SM);
         // Padding that brings a line of the label up to the control's height; a row of plain text
         // stays as tall as a small control.
         let pad_y = ((control.height() - control.text() * 1.2) / 2.0).round();
-        s.spacing.button_padding = egui::vec2(if roomy { space::MD } else { space::SM }, pad_y);
+        s.spacing.button_padding = egui::vec2(space::MD, pad_y);
         s.spacing.interact_size = egui::Vec2::splat(ControlSize::Small.height());
         s.spacing.menu_margin = pad::MENU;
         // A dropdown's list shows nine rows and a half before it scrolls: the half row says there's more.
@@ -943,6 +964,21 @@ mod tests {
             assert_eq!(ThemeKind::from_id(k.id()), k);
         }
         assert_eq!(ThemeKind::from_id("nonsense"), ThemeKind::Studio);
+    }
+
+    /// System follows the system's appearance (dark when it doesn't say); a chosen theme ignores it.
+    #[test]
+    fn system_follows_the_systems_appearance() {
+        use egui::Theme::{Dark, Light};
+        for choice in [SYSTEM, "System", " system ", ""] {
+            assert_eq!(resolve(choice, Some(Light)), ThemeKind::StudioLight, "{choice:?}");
+            assert_eq!(resolve(choice, Some(Dark)), ThemeKind::Studio, "{choice:?}");
+            assert_eq!(resolve(choice, None), ThemeKind::Studio, "{choice:?}");
+        }
+        for system in [Some(Light), Some(Dark), None] {
+            assert_eq!(resolve("studio", system), ThemeKind::Studio);
+            assert_eq!(resolve("studio-light", system), ThemeKind::StudioLight);
+        }
     }
 
     /// WCAG 2.x contrast ratio between two opaque colours.

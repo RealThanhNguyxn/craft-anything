@@ -48,31 +48,12 @@ impl Tlv {
 /// Read one TLV at `off`. Only single-byte tags and definite lengths of up to 4 bytes.
 /// Redundant length encodings are retained and flagged, rather than hiding their contents.
 pub fn read(data: &[u8], off: usize) -> Option<Tlv> {
-    let tag = *data.get(off)?;
-    if tag & 0x1f == 0x1f {
-        return None;
-    }
-    let l0 = *data.get(off.checked_add(1)?)?;
-    let (len, hdr, non_minimal_length) = if l0 & 0x80 == 0 {
-        (usize::from(l0), 2usize, false)
-    } else {
-        let n = usize::from(l0 & 0x7f);
-        if n == 0 || n > 4 {
-            return None;
-        }
-        let leading_zero = *data.get(off.checked_add(2)?)? == 0;
-        let mut v = 0usize;
-        for i in 0..n {
-            v = v.checked_mul(256)?.checked_add(usize::from(*data.get(off.checked_add(2 + i)?)?))?;
-        }
-        (v, 2 + n, leading_zero || v < 128)
-    };
-    let content = off.checked_add(hdr)?;
-    let end = content.checked_add(len)?;
-    if end > data.len() {
-        return None;
-    }
-    Some(Tlv { tag, start: off, content, len, non_minimal_length })
+    let input = data.get(off..)?;
+    // Keep the app's definite-length contract. In particular, signed bytes must not be
+    // reinterpreted through the BER indefinite-length path during this partial cutover.
+    let value = craft_pkcs7::inspection::Cursor::new(input).next_element().ok()??;
+    let header = value.raw().len().checked_sub(value.value().len())?;
+    Some(Tlv { tag: value.tag(), start: off, content: off.checked_add(header)?, len: value.value().len(), non_minimal_length: value.non_minimal_length() })
 }
 
 /// Whether a non-minimal length is found while walking constructed elements within the
@@ -335,21 +316,23 @@ pub fn certificate(data: &[u8]) -> Option<CertInfo> {
 
 /// The certificates (whole DER TLVs) inside a PKCS#7 SignedData blob, as in `META-INF/*.RSA`.
 pub fn pkcs7_certificates(data: &[u8]) -> Vec<&[u8]> {
-    let Some(ci) = read(data, 0).filter(|t| t.tag == 0x30) else { return Vec::new() };
-    let kids = children(data, &ci);
-    let is_signed = kids.first().is_some_and(|t| t.tag == 0x06 && oid(t.bytes(data).unwrap_or(&[])) == "1.2.840.113549.1.7.2");
-    if !is_signed {
+    let Ok((mut view, _)) = craft_pkcs7::inspection::cms::SignedDataView::parse(data) else { return Vec::new() };
+    // Preserve the positional certificate field: do not search later optional fields for a set.
+    let Ok(Some(certificates)) = view.remaining_fields.next_element() else { return Vec::new() };
+    if certificates.tag() != 0xa0 {
         return Vec::new();
     }
-    let Some(explicit) = kids.get(1).filter(|t| t.tag == 0xa0) else { return Vec::new() };
-    let Some(sd) = children(data, explicit).into_iter().next().filter(|t| t.tag == 0x30) else { return Vec::new() };
-    let fields = children(data, &sd);
-    let [version, digests, content, certificates, ..] = fields.as_slice() else { return Vec::new() };
-    if (version.tag, digests.tag, content.tag, certificates.tag) != (0x02, 0x31, 0x30, 0xa0) {
-        return Vec::new();
+    let Ok(mut choices) = certificates.children() else { return Vec::new() };
+    let mut out = Vec::new();
+    // The shared cursor retains the 4096-child prefix bound. Keep scanning that bounded prefix
+    // after retaining 64 certificates, as the previous child-list reader did, without validating
+    // certificate contents or turning a partial listing into an authentication result.
+    while let Ok(Some(choice)) = choices.next_element() {
+        if choice.tag() == 0x30 && out.len() < MAX_CERTS {
+            out.push(choice.raw());
+        }
     }
-    // Only the untagged SEQUENCE choice is an X.509 certificate.
-    children(data, certificates).into_iter().filter(|t| t.tag == 0x30).take(MAX_CERTS).filter_map(|t| t.whole(data)).collect()
+    out
 }
 
 /// The dotted OID of an AlgorithmIdentifier SEQUENCE's first child (the algorithm OID).

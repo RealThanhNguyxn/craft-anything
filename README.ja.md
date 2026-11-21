@@ -169,7 +169,7 @@ craft-anything-cli rebuild https://example.com "Recreate this website"
 Rust **1.97 以降**が必要です (依存関係が要求します。`rustup update`)。Debian か Ubuntu では、デスクトップアプリには次のものも必要です:
 
 ```sh
-sudo apt-get install libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev libgtk-3-dev
+sudo apt-get install build-essential libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev libgtk-3-dev
 ```
 
 続いて:

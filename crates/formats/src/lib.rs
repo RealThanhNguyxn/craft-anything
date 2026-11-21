@@ -10,7 +10,6 @@ pub mod asar;
 pub mod authenticode;
 pub mod axml;
 pub mod binary;
-mod bptc;
 pub mod bun_program;
 pub mod bytes;
 pub mod car;

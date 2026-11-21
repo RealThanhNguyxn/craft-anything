@@ -37,6 +37,9 @@ pub fn estimate_tokens(history: &[Msg]) -> u64 {
             Block::ToolUse { input, name, .. } => name.len() + input.to_string().len(),
             Block::ToolExtra { extra, .. } => extra.to_string().len(),
             Block::ToolResult { content, .. } => content.len(),
+            // A picture's size in a model's context doesn't follow its bytes.
+            Block::Image { name, data, .. } if data.is_empty() => Block::image_note(name).len(),
+            Block::Image { .. } => (crate::model::IMAGE_TOKENS * 4) as usize,
         })
         .sum();
     (chars / 4) as u64
@@ -50,8 +53,8 @@ pub fn estimate_overhead(system: &str, tools: &[crate::model::ToolDef]) -> u64 {
     ((system.len() + tool_chars) / 4) as u64
 }
 
-/// Shorten tool results and drop reasoning in all but the last [`KEEP_RECENT`] messages. Returns
-/// how many blocks changed.
+/// Shorten tool results, drop reasoning and replace pictures by their note in all but the last
+/// [`KEEP_RECENT`] messages. Returns how many blocks changed.
 pub fn trim_old(history: &mut [Msg]) -> usize {
     let end = history.len().saturating_sub(KEEP_RECENT);
     let mut changed = 0;
@@ -61,6 +64,13 @@ pub fn trim_old(history: &mut [Msg]) -> usize {
         m.blocks.retain(|b| !matches!(b, Block::Thinking { .. } | Block::RedactedThinking { .. }));
         changed += before - m.blocks.len();
         for b in &mut m.blocks {
+            if let Block::Image { name, data, .. } = b
+                && !data.is_empty()
+            {
+                *b = Block::Text { text: Block::image_note(name) };
+                changed += 1;
+                continue;
+            }
             if let Block::ToolResult { content, .. } = b
                 && content.len() > TRIMMED_KEEP + 100
                 && !content.ends_with(TRIMMED_NOTE)
@@ -271,5 +281,32 @@ mod tests {
         std::fs::write(&p, text).unwrap();
         assert!(load(&p, true).is_some());
         assert!(load(&p, false).is_none(), "an old transcript may have read the original");
+    }
+
+    #[test]
+    fn pictures_count_toward_the_budget_and_old_ones_are_trimmed_to_a_note() {
+        let png = b"\x89PNG\r\n\x1a\n".repeat(10_000);
+        let picture = || Block::image("now.png", &png).unwrap();
+        let shown = |text: &str| Msg { role: Speaker::User, blocks: vec![Block::Text { text: text.into() }, picture()] };
+        // A picture is counted as a picture, not by its 80 kB of base64.
+        assert_eq!(estimate_tokens(&[shown("")]), crate::model::IMAGE_TOKENS);
+        let mut h = vec![shown("Like this")];
+        h.extend(convo(KEEP_RECENT));
+        h.push(shown("Now like this"));
+        let changed = trim_old(&mut h);
+        assert!(changed > 0);
+        assert_eq!(h[0].blocks[1], Block::Text { text: Block::image_note("now.png") }, "an old picture becomes its note");
+        assert!(matches!(&h.last().unwrap().blocks[1], Block::Image { data, .. } if !data.is_empty()), "a recent one is kept");
+        assert!(well_formed(&h));
+        assert_eq!(trim_old(&mut h), 0, "nothing more to trim the second time");
+
+        // A resumed conversation knows a picture was there, but not its bytes, and counts its note.
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("transcript.json");
+        save(&p, &[shown("Like this")], true).unwrap();
+        assert!(std::fs::metadata(&p).unwrap().len() < 1000, "the bytes aren't saved");
+        let back = load(&p, true).unwrap();
+        assert!(matches!(&back[0].blocks[1], Block::Image { name, data, .. } if name == "now.png" && data.is_empty()));
+        assert_eq!(estimate_tokens(&back), (("Like this".len() + Block::image_note("now.png").len()) / 4) as u64);
     }
 }

@@ -6,7 +6,8 @@ use craft_update::{App, Http, Paths, Platform, Release, Stop, self_update};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
 pub const APP: App = App::new("craft-anything", "Craft Anything", "Build and investigate apps", "storytold/craft-anything");
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The version running, as the window and Home's notice name it.
+pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// A pinned, nightly, or unknown launcher choice must never be replaced by a stable update.
 fn stable_choice() -> Result<(), String> {
@@ -15,6 +16,20 @@ fn stable_choice() -> Result<(), String> {
     } else {
         Err(tr("ArtCraft Launcher manages this app's version. Change its version there."))
     }
+}
+
+/// Ask GitHub for a newer stable release, and whether this installation can install it itself.
+/// A launcher choice other than stable ends the check before any request.
+fn release_check() -> (Result<Option<Release>, String>, bool) {
+    let result = stable_choice()
+        .and_then(|()| Http::new(concat!("Craft Anything/", env!("CARGO_PKG_VERSION"))))
+        .and_then(|http| craft_update::check_for_update(&APP, &http, VERSION));
+    let installable = result
+        .as_ref()
+        .ok()
+        .and_then(|release| release.as_ref())
+        .is_some_and(|release| self_update::is_self_updating(&APP) && self_update::release_installs(&APP, release));
+    (result, installable)
 }
 
 enum Reply {
@@ -31,6 +46,10 @@ pub struct Updates {
     worker: Option<Receiver<Reply>>,
     installing: bool,
     restart: Option<self_update::Restart>,
+    /// The first desktop frame starts a check that opens nothing.
+    check_requested: bool,
+    /// Home's notice was dismissed for this session.
+    later: bool,
 }
 impl Updates {
     /// Read the previous update result when the first desktop frame can show it.
@@ -38,23 +57,24 @@ impl Updates {
         self.read_outcome_requested = true;
     }
 
+    /// Run the manual check when the first desktop frame is drawn, without opening its window:
+    /// Home offers a release that is found ([`Self::offered`]), and any other answer says nothing.
+    pub fn check_at_start(&mut self) {
+        self.check_requested = true;
+    }
+
     /// Start a manual check off the UI thread; repeated requests share the running check.
     pub fn check(&mut self, ctx: &egui::Context) {
-        self.check_using(ctx, || {
-            let result = stable_choice()
-                .and_then(|()| Http::new(concat!("Craft Anything/", env!("CARGO_PKG_VERSION"))))
-                .and_then(|http| craft_update::check_for_update(&APP, &http, VERSION));
-            let installable = result
-                .as_ref()
-                .ok()
-                .and_then(|release| release.as_ref())
-                .is_some_and(|release| self_update::is_self_updating(&APP) && self_update::release_installs(&APP, release));
-            (result, installable)
-        });
+        self.check_using(ctx, release_check);
     }
 
     fn check_using(&mut self, ctx: &egui::Context, check: impl FnOnce() -> (Result<Option<Release>, String>, bool) + Send + 'static) {
         self.open = true;
+        self.begin(ctx, check);
+    }
+
+    /// Start `check` on a worker unless one is running. The window stays as it is.
+    fn begin(&mut self, ctx: &egui::Context, check: impl FnOnce() -> (Result<Option<Release>, String>, bool) + Send + 'static) {
         if self.worker.is_some() {
             return;
         }
@@ -109,6 +129,7 @@ impl Updates {
         {
             self.apply_outcome(self_update::take_outcome(&paths, VERSION));
         }
+        self.start_requested_check(ctx, release_check);
         let reply = self.worker.as_ref().map(Receiver::try_recv);
         match reply {
             Some(Ok(Reply::Checked(result, installable))) => {
@@ -186,6 +207,29 @@ impl Updates {
         }
         self.installing
     }
+    /// The check at start, once. The last update's result, when its window is open, is left on
+    /// screen: "Check again" is there.
+    fn start_requested_check(&mut self, ctx: &egui::Context, check: impl FnOnce() -> (Result<Option<Release>, String>, bool) + Send + 'static) {
+        if std::mem::take(&mut self.check_requested) && !self.open {
+            self.begin(ctx, check);
+        }
+    }
+
+    /// The newer release the last check found, for Home's notice, until the person says "Later".
+    pub fn offered(&self) -> Option<&Release> {
+        self.release.as_ref().filter(|_| !self.later)
+    }
+
+    /// Open the window on what the last check found: the release, and installing it.
+    pub fn open(&mut self) {
+        self.open = true;
+    }
+
+    /// Hide Home's notice for the rest of this session.
+    pub fn later(&mut self) {
+        self.later = true;
+    }
+
     fn apply_outcome(&mut self, outcome: Option<self_update::Outcome>) {
         match outcome {
             Some(self_update::Outcome::Installed(version)) => {
@@ -269,6 +313,24 @@ mod tests {
             assert!(updates.release.is_none());
             assert!(!updates.installable);
             assert!(finish_helper().is_none());
+            // The check at start is the same check: the pin ends it before any request, and
+            // Home is offered nothing.
+            let mut at_start = Updates::default();
+            at_start.check_at_start();
+            draw(&mut at_start, true, false);
+            let reply = at_start
+                .worker
+                .as_ref()
+                .expect("start check worker")
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("pin check finishes without network");
+            let (tx, rx) = channel();
+            tx.send(reply).expect("receiver");
+            at_start.worker = Some(rx);
+            draw(&mut at_start, true, false);
+            assert!(at_start.message.contains("ArtCraft Launcher"));
+            assert!(at_start.offered().is_none());
+            assert!(!at_start.open, "a check nobody asked for opens no window");
             #[cfg(target_os = "linux")]
             {
                 // This child has an isolated XDG data folder; never consume a user's update record.
@@ -369,6 +431,86 @@ mod tests {
         updates.finish();
         updates.apply_outcome(None);
     }
+    /// Runs the check at start with `answer` in place of the network, and takes its reply.
+    fn checked_at_start(updates: &mut Updates, answer: Result<Option<Release>, String>) {
+        updates.check_at_start();
+        updates.start_requested_check(&egui::Context::default(), move || (answer, false));
+        let reply = updates.worker.as_ref().expect("start check worker").recv_timeout(std::time::Duration::from_secs(5)).expect("worker finishes");
+        let (tx, rx) = channel();
+        tx.send(reply).expect("receiver");
+        updates.worker = Some(rx);
+        draw(updates, true, false);
+    }
+
+    fn newer_release() -> Release {
+        Release { tag: "v99.0.0".into(), version: craft_update::version::parse("99.0.0"), html_url: APP.releases_url(), ..Release::default() }
+    }
+
+    #[test]
+    fn the_check_at_start_opens_nothing_and_offers_what_it_finds() {
+        let mut updates = Updates::default();
+        checked_at_start(&mut updates, Ok(Some(newer_release())));
+        assert!(!updates.open, "only Home says so");
+        assert_eq!(updates.offered().map(Release::version_label).as_deref(), Some("99.0.0"));
+        updates.later();
+        assert!(updates.offered().is_none(), "Later hides the notice");
+        assert!(updates.release.is_some(), "and Help ▸ Check for Updates still has the release");
+
+        let mut failed = Updates::default();
+        checked_at_start(&mut failed, Err("network unavailable".into()));
+        assert!(!failed.open, "a failed check nobody asked for says nothing");
+        assert!(failed.offered().is_none());
+
+        let mut current = Updates::default();
+        checked_at_start(&mut current, Ok(None));
+        assert!(!current.open);
+        assert!(current.offered().is_none());
+    }
+
+    #[test]
+    fn the_check_at_start_runs_once_and_leaves_the_last_updates_result_on_screen() {
+        let ctx = egui::Context::default();
+        let mut updates = Updates::default();
+        updates.start_requested_check(&ctx, || panic!("no check was asked for"));
+        assert!(updates.worker.is_none());
+
+        updates.check_at_start();
+        updates.apply_outcome(Some(self_update::Outcome::Failed("installer refused the update".into())));
+        updates.start_requested_check(&ctx, || panic!("the result window is open"));
+        assert!(updates.worker.is_none());
+        assert!(updates.message.contains("installer refused the update"));
+        updates.open = false;
+        updates.start_requested_check(&ctx, || panic!("the request was for the first frame only"));
+        assert!(updates.worker.is_none());
+    }
+
+    #[test]
+    fn home_offers_a_found_release_and_later_hides_it() {
+        use egui_kittest::kittest::Queryable as _;
+        let mut harness = egui_kittest::Harness::builder().with_size(egui::vec2(1280.0, 900.0)).with_max_steps(32).build_eframe(|cc| {
+            crate::CraftApp::setup_context(&cc.egui_ctx);
+            let mut app = crate::demo::app(crate::demo::engine(craft_anything_engine::Mode::Beginner, true));
+            crate::demo::fill_project(&mut app);
+            app.state.screen = crate::state::Screen::Home;
+            app
+        });
+        harness.run_steps(3);
+        assert!(harness.query_by_label("Get it").is_none(), "no newer release, no notice");
+
+        harness.state_mut().updates.checked(Ok(Some(newer_release())));
+        harness.run_steps(3);
+        harness.get_by_label_contains(&format!("Craft Anything 99.0.0 is available (you have {VERSION})"));
+        harness.get_by_label("Get it").click();
+        harness.run_steps(3);
+        assert!(harness.state().updates.open, "Get it opens the window that installs the release");
+        harness.get_by_label("Update and restart");
+
+        harness.get_by_label("Later").click();
+        harness.run_steps(3);
+        assert!(harness.query_by_label_contains("is available (you have").is_none(), "Later hides the notice for the session");
+        assert!(harness.query_by_label("Get it").is_none());
+    }
+
     #[test]
     fn a_failed_helper_is_reported_when_the_old_app_restarts() {
         let mut updates = Updates::default();

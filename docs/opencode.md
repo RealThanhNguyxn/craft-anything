@@ -18,7 +18,9 @@ doesn't have it. 2.x comes from npm's `@opencode/cli` package (`npm install -g @
 with the OpenCode desktop app, whose CLI is `opencode-cli` in the app's resources folder
 (`/opt/OpenCode/resources/opencode-cli` from the Linux package), and from OpenCode's GitHub
 releases. When the `opencode` on your PATH is 1.x, install `@opencode/cli`, or point the backend
-at a 2.x CLI: step 2 below, or `craft-anything-cli ai program OpenCode <path>`.
+at a 2.x CLI: step 2 below, or `craft-anything-cli ai program OpenCode <path>`. If npm's
+`opencode-ai` gave you 1.x, remove it first (`npm uninstall -g opencode-ai`): both packages
+install the `opencode` command, so installing `@opencode/cli` beside it fails with `EEXIST`.
 
 **Don't start OpenCode during a build.** OpenCode's shared service resumes every session it finds
 running, including the one a build's private server is driving: started mid-build (opening the

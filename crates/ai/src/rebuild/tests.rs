@@ -262,6 +262,30 @@ fn built_program_finds_the_cargo_output_only() {
     assert_eq!(built_program(d.path()), Some(debug.join(exe("snake"))));
 }
 
+/// R5.7: a project that moves Cargo's output writes its program where the config says, not in
+/// `target/`; Play and the checks must look there.
+#[test]
+fn built_program_follows_cargos_moved_target_directory() {
+    let d = tempfile::tempdir().unwrap();
+    let app = d.path();
+    std::fs::create_dir_all(app.join(".cargo")).unwrap();
+    std::fs::write(app.join(".cargo/config.toml"), "[build]\ntarget-dir = \"out\"\n").unwrap();
+    std::fs::write(app.join("Cargo.toml"), "[package]\nname = \"cargo-target-probe\"\n").unwrap();
+    std::fs::create_dir_all(app.join("src")).unwrap();
+    std::fs::write(app.join("src/main.rs"), "fn main() {}\n").unwrap();
+    let debug = app.join("out").join("debug");
+    std::fs::create_dir_all(&debug).unwrap();
+    let exe = if cfg!(windows) { "cargo-target-probe.exe" } else { "cargo-target-probe" };
+    let program = debug.join(exe);
+    std::fs::write(&program, "x").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    assert_eq!(built_program(app), Some(program));
+}
+
 #[test]
 fn play_starts_the_window_app_of_a_workspace_not_its_newest_program() {
     // Play started the CLI a workspace also built (it was newer), which printed help and quit
@@ -357,6 +381,43 @@ fn a_launcher_leads_to_the_game_and_its_files() {
     assert!(inv.contains("Maps and levels: 1 files") && inv.contains("Textures and pictures: 1 files") && inv.contains("Sounds and music: 1 files"), "{inv}");
     assert!(inv.contains("brick.jpg"));
     assert!(inv.contains("Read-me and licence files: 1 files") && !inv.contains("Settings and scripts"), "{inv}");
+}
+
+/// A 1990s Windows game's folder copied to Linux or macOS: no file has an executable
+/// bit, so only counting programs this computer can start found none, and Deep mode skipped Ghidra.
+#[test]
+fn a_windows_games_folder_has_its_program_on_every_system() {
+    let d = tempfile::tempdir().unwrap();
+    let game = d.path();
+    std::fs::create_dir_all(game.join("Install")).unwrap();
+    for (name, bytes) in [
+        ("Game.exe", 454),
+        ("Launcher.exe", 173),
+        ("setup.exe", 900),         // bigger, but an installer
+        ("Install/setup.exe", 800), // the same, one folder down
+        ("MSVCRT40.DLL", 1000),     // bigger still, but a library, not the game
+        ("game.dat", 4600),
+    ] {
+        std::fs::write(game.join(name), vec![0u8; bytes]).unwrap();
+    }
+    assert_eq!(locate(game, "game"), (game.join("Game.exe"), Some(game.to_path_buf())), "the game's own program");
+    let bat = game.join("play.bat");
+    std::fs::write(&bat, "start Launcher.exe\n").unwrap();
+    assert_eq!(locate(&bat, "app").0, game.join("Launcher.exe"), "the program a launcher starts");
+    assert!(studies_as_program(&game.join("GAME.EXE")) && !studies_as_program(&game.join("MSVCRT40.DLL")));
+}
+
+#[test]
+fn a_windows_console_program_is_studied_but_started_only_on_windows() {
+    let d = tempfile::tempdir().unwrap();
+    let folder = d.path();
+    std::fs::write(folder.join("Tool.exe"), craft_anything_testkit::pe64_subsystem(3)).unwrap();
+    let program = locate(folder, "game").0;
+    assert_eq!(program, folder.join("Tool.exe"), "picked for Deep study on every system");
+    // Without the start check, runtime study would run it with each input, as a console program.
+    assert!(kinds::runs::is_console(&program), "a console program by its PE header");
+    assert_eq!(study::may_start(&program), cfg!(windows), "started only where Windows programs run");
+    assert!(!study::may_start(folder), "a folder is never started");
 }
 
 #[test]
@@ -1780,53 +1841,6 @@ mod picking_up_a_build {
         }
     }
 
-    /// The rebuild tests use a shell stand-in for OpenCode. Keep its protocol and argument
-    /// handling, but don't require an installed `craft-anything-cli` beside the test binary.
-    /// The helper preflight itself is covered by `a_missing_helper_stops_the_build_before_any_work`.
-    struct TestOpenCode;
-
-    impl crate::cli_agents::AgentAdapter for TestOpenCode {
-        fn ids(&self) -> &'static [&'static str] {
-            crate::cli_agents::adapters::OpenCode.ids()
-        }
-
-        fn has_model_catalog(&self) -> bool {
-            crate::cli_agents::adapters::OpenCode.has_model_catalog()
-        }
-
-        fn check_tool_server(&self, _stop: &CancelToken) -> Result<(), ToolError> {
-            Ok(())
-        }
-
-        fn mcp_env(&self, mcp: &crate::cli_agents::McpCommand, access: crate::cli_agents::Access) -> Result<Option<(&'static str, String)>, ToolError> {
-            crate::cli_agents::adapters::OpenCode.mcp_env(mcp, access)
-        }
-
-        fn args(&self, cx: &crate::cli_agents::ArgsCx) -> Vec<String> {
-            crate::cli_agents::adapters::OpenCode.args(cx)
-        }
-
-        fn required_flags(&self) -> (&'static [&'static str], &'static [&'static str]) {
-            crate::cli_agents::adapters::OpenCode.required_flags()
-        }
-
-        fn plain_fallback(&self) -> bool {
-            crate::cli_agents::adapters::OpenCode.plain_fallback()
-        }
-
-        fn discard_unfinished(&self, program: &str, id: &str, host: Option<&str>) -> Result<(), ToolError> {
-            crate::cli_agents::adapters::OpenCode.discard_unfinished(program, id, host)
-        }
-
-        fn discards_sessions(&self) -> bool {
-            crate::cli_agents::adapters::OpenCode.discards_sessions()
-        }
-
-        fn parse(&self, parser: &mut crate::cli_agents::StreamParser, value: &serde_json::Value) -> Vec<crate::AgentEvent> {
-            crate::cli_agents::adapters::OpenCode.parse(parser, value)
-        }
-    }
-
     struct Bench {
         _dir: tempfile::TempDir,
         hub: AiHub,
@@ -1877,7 +1891,6 @@ mod picking_up_a_build {
 
     fn try_with(b: &Bench, ws: &Workspace, mut opts: RunOptions) -> (bool, Vec<feed::FeedItem>) {
         opts.kinds.register(Arc::new(FlakyKind));
-        opts.adapters.register(Arc::new(TestOpenCode));
         opts.backend = Some("Stand-in".into());
         let run = RebuildRun::start(&b.hub, Workspace::open(&ws.root).unwrap(), opts).unwrap();
         let began = Instant::now();
@@ -3682,6 +3695,72 @@ fn decompiling_once_is_remembered_by_the_project() {
     assert!(Workspace::open(&ws.root).unwrap().manifest.decompiled, "a later run reads it from craft.json");
 }
 
+/// A builder on an API model that asks for consent: a Build tool, then a plugin's tool.
+#[derive(Default)]
+struct AsksConsent {
+    events: Vec<AgentEvent>,
+    allowed: Vec<String>,
+    refused: Vec<(String, String)>,
+}
+
+impl Conversation for AsksConsent {
+    fn send(&mut self, _text: &str) {
+        let ask = |id: &str, tool: &str| AgentEvent::ConsentNeeded { call_id: id.into(), tool: tool.into(), title: tool.into(), explanation: String::new() };
+        self.events = vec![
+            ask("1", "build_command_run"),
+            ask("2", "plugin_tool"),
+            AgentEvent::TurnDone { backend: "test".into(), input_tokens: 0, output_tokens: 0, tokens_unknown: false, cost_usd: None, cost_is_estimate: false },
+        ];
+    }
+    fn poll(&mut self) -> Vec<AgentEvent> {
+        std::mem::take(&mut self.events)
+    }
+    fn answer_consent(&mut self, call_id: &str, allow: bool) {
+        assert!(allow, "a refusal says why: {call_id}");
+        self.allowed.push(call_id.into());
+    }
+    fn refuse_consent(&mut self, call_id: &str, why: &str) {
+        self.refused.push((call_id.into(), why.into()));
+    }
+    fn stop(&mut self) {}
+    fn is_busy(&self) -> bool {
+        !self.events.is_empty()
+    }
+}
+
+/// #1938: a tool outside the Build tools that needs consent is refused without a card, and the
+/// builder is told that nobody was asked and where a plugin's consent is set, not "the user said no".
+#[test]
+fn a_build_says_why_it_refused_a_tool_that_needs_consent() {
+    let d = tempfile::tempdir().unwrap();
+    let mut ws = Workspace::create(d.path(), "Sim", "Recreate this game", TargetRef::None).unwrap();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut w = Worker {
+        wake: Default::default(),
+        engine: Arc::new(Engine::new(craft_anything_engine::testing::session())),
+        tx,
+        stop: CancelToken::default(),
+        preview: Arc::default(),
+        seen: HashSet::new(),
+        inbox: Inbox::new(ws.inbox_dir()),
+        editor: None,
+        notes: Arc::default(),
+        feed: Arc::new(Mutex::new(feed::FeedLog::open(&ws))),
+        keys: crate::KeyStore::file_only(ws.root.join("keys.toml")),
+        kept_checks: Mutex::default(),
+        assets: false,
+        usage: None,
+        self_check: None,
+        reset_progress_after_notes: false,
+    };
+    let mut builder = AsksConsent::default();
+    w.turn(&mut ws, &mut builder, "Build it.", true, None).unwrap();
+    assert_eq!(builder.allowed, ["1"], "the Build tools apply the approval policy themselves");
+    let [(id, why)] = &builder.refused[..] else { panic!("{:?}", builder.refused) };
+    assert_eq!(id, "2");
+    assert!(why.contains("plugin_tool") && why.contains("Nobody was asked") && why.contains("`consent`"), "{why}");
+}
+
 /// A later request's run, reading the project from disk, reminds only a builder that never
 /// decompiled in it, and only in Deep mode on a program.
 #[test]
@@ -4258,7 +4337,9 @@ fn a_question_names_a_replaced_saved_builder() {
     let answered = super::question::ask(&hub, &settings, None, &ws, "where is it?", &CancelToken::default()).unwrap();
     assert_eq!(answered.backend, "Claude");
     let notice = answered.builder_notice.as_deref().unwrap_or_default();
-    assert!(notice.contains("Off") && notice.contains("Claude"), "{notice}");
+    assert_eq!(notice, "The AI chosen for this project (Off) is turned off or no longer set up. Claude builds instead.");
+    let response = serde_json::to_value(&answered).unwrap();
+    assert_eq!(response["builder_replacement"], serde_json::json!({"saved": "Off", "used": "Claude"}));
 }
 
 /// A name given on purpose is never ignored: a backend that is off is refused in words that say

@@ -55,9 +55,12 @@ pub struct Answered {
     /// The cost is the agent's own estimate at API prices, not a key's charge.
     #[serde(default)]
     pub cost_is_estimate: bool,
-    /// The saved builder that was off or gone, when another AI answered in its place.
+    /// English notice for headless callers, when another AI replaced the saved builder.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub builder_notice: Option<String>,
+    /// Literal names for frontends to format in the person's UI language.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub builder_replacement: Option<super::BuilderReplacement>,
 }
 
 /// Where a question's answer comes from: the builder's session only when the project has one for
@@ -91,7 +94,8 @@ pub fn ask(
         return Err(ToolError::invalid(format!("A question is 1 to {MAX_QUESTION} characters.")));
     }
     let cfg = crate::AiConfig::from_settings(settings);
-    let builder_notice = super::builder_replacement(&cfg, ws, None).map(|r| super::replaced_builder_notice(&r.saved, &r.used));
+    let builder_replacement = super::builder_replacement(&cfg, ws, None);
+    let builder_notice = builder_replacement.as_ref().map(|r| super::replaced_builder_notice(&r.saved, &r.used));
     let entry = builder_backend(&cfg, project_builder(&cfg, ws))?;
     let deep = settings.deep_mode;
     super::refuse_deep_session_reuse_in_clean_room(ws, &entry.config.model, &entry.options.args, deep)?;
@@ -184,7 +188,7 @@ pub fn ask(
     } else {
         (cost_usd, cost_is_estimate)
     };
-    Ok(Answered { answer, from, backend: entry.config.name.clone(), cost_usd, cost_is_estimate, builder_notice })
+    Ok(Answered { answer, from, backend: entry.config.name.clone(), cost_usd, cost_is_estimate, builder_notice, builder_replacement })
 }
 
 /// The builder's session, kept in the project, put back where its agent looks when this computer

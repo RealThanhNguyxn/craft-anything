@@ -37,6 +37,9 @@ refuses.
   `.js` files, and `no-cache` on `index.html`.
 - **HTTPS:** WebGPU (and the clipboard) only work in a secure context, which means `https://`
   or `http://localhost`. Over plain HTTP elsewhere, the app falls back to WebGL2.
+- **Content-Type sniffing:** send `X-Content-Type-Options: nosniff` on all responses. This stops
+  browsers from guessing a file's type and ensures `.wasm` and `.js` are only executed under their
+  declared MIME types. The `_headers` and `.htaccess` files already set it.
 - **No special isolation headers:** Craft Anything doesn't use `SharedArrayBuffer`, so it doesn't
   need `Cross-Origin-Opener-Policy` or `Cross-Origin-Embedder-Policy`. If your site already sends
   COEP `require-corp`, also send `Cross-Origin-Resource-Policy: same-origin` (or `cross-origin`

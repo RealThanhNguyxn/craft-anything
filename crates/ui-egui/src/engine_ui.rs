@@ -17,7 +17,7 @@ use craft_anything_engines::game::{self, Builder, Inventory};
 use craft_anything_engines::ghidra::{self, get};
 use egui::{RichText, Ui, Vec2};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -118,8 +118,10 @@ impl CraftApp {
 /// Getting Ghidra for Deep mode: asked first, then downloaded, checked and set up in the background.
 #[derive(Debug, Default)]
 pub struct GhidraFlow {
-    /// Whether Ghidra was found; `None` until looked for again (after a settings change or install).
-    pub ready: Option<bool>,
+    /// Where Ghidra's launcher was found, or that it wasn't; `None` until looked for again (after
+    /// a settings change or install). Looking searches folders and may read a start script, so
+    /// it isn't done while drawing.
+    pub found: Option<Option<PathBuf>>,
     /// The download running, as a job.
     pub job: Option<u64>,
     /// The project to start once Ghidra is ready (or the person goes on without it): the draft
@@ -130,8 +132,13 @@ pub struct GhidraFlow {
 impl CraftApp {
     /// Ghidra is here for Deep mode to use (looked up once, then remembered).
     pub fn ghidra_ready(&mut self) -> bool {
+        self.ghidra_found().is_some()
+    }
+
+    /// Ghidra's launcher, where Deep mode would run it (looked up once, then remembered).
+    pub fn ghidra_found(&mut self) -> Option<&Path> {
         let settings = &self.settings;
-        *self.ghidra.ready.get_or_insert_with(|| settings.ghidra_launcher().is_some())
+        self.ghidra.found.get_or_insert_with(|| settings.ghidra_launcher()).as_deref()
     }
 
     /// Deep mode is on, but it can't use Ghidra yet.
@@ -364,8 +371,7 @@ pub fn ghidra_status(app: &mut CraftApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
     if let Some((fraction, message)) = app.ghidra_download() {
         progress_bar(ui, fraction, &message);
-    } else if app.ghidra_ready() {
-        let at = app.settings.ghidra_launcher().map(|p| p.display().to_string()).unwrap_or_default();
+    } else if let Some(at) = app.ghidra_found().map(|p| p.display().to_string()) {
         widgets::pill(ui, "Installed", t.success, t.raised).on_hover_text(at);
     } else {
         ui.horizontal(|ui| {
